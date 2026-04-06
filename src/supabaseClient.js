@@ -1,6 +1,6 @@
 // src/supabaseClient.js
 // ─────────────────────────────────────────────
-// Supabase-Client-Konfiguration
+// Supabase-Client mit Auth-Support
 // ─────────────────────────────────────────────
 
 import { createClient } from "@supabase/supabase-js";
@@ -19,11 +19,50 @@ if (!supabaseUrl || !supabaseAnonKey) {
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // ─────────────────────────────────────────────
-// Datenbank-API (alle Calls gegen Supabase)
+// AUTH-API
+// ─────────────────────────────────────────────
+
+export const authAPI = {
+  async getUser() {
+    const { data: { user } } = await supabase.auth.getUser();
+    return user;
+  },
+
+  async getSession() {
+    const { data: { session } } = await supabase.auth.getSession();
+    return session;
+  },
+
+  async signUp(email, password) {
+    const { data, error } = await supabase.auth.signUp({ email, password });
+    if (error) throw error;
+    return data;
+  },
+
+  async signIn(email, password) {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+    return data;
+  },
+
+  async signOut() {
+    const { error } = await supabase.auth.signOut();
+    if (error) throw error;
+  },
+
+  onAuthChange(callback) {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      callback(session?.user || null);
+    });
+    return subscription;
+  },
+};
+
+// ─────────────────────────────────────────────
+// REZEPTE-API
 // ─────────────────────────────────────────────
 
 export const recipesAPI = {
-  // Alle Rezepte laden, neueste zuerst
   async list() {
     const { data, error } = await supabase
       .from("recipes")
@@ -33,7 +72,6 @@ export const recipesAPI = {
     return data || [];
   },
 
-  // Einzelnes Rezept laden
   async get(id) {
     const { data, error } = await supabase
       .from("recipes")
@@ -44,10 +82,13 @@ export const recipesAPI = {
     return data;
   },
 
-  // Neues Rezept erstellen
   async create(recipe) {
-    // id rausnehmen, damit Supabase eine UUID generiert
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+
     const { id, ...payload } = recipe;
+    payload.user_id = user.id;
+
     const { data, error } = await supabase
       .from("recipes")
       .insert([payload])
@@ -57,9 +98,8 @@ export const recipesAPI = {
     return data;
   },
 
-  // Rezept aktualisieren
   async update(id, recipe) {
-    const { id: _, created_at, ...payload } = recipe;
+    const { id: _, created_at, user_id, ...payload } = recipe;
     payload.updated_at = new Date().toISOString();
     const { data, error } = await supabase
       .from("recipes")
@@ -71,55 +111,64 @@ export const recipesAPI = {
     return data;
   },
 
-  // Rezept löschen
   async delete(id) {
     const { error } = await supabase.from("recipes").delete().eq("id", id);
     if (error) throw error;
   },
 };
 
+// ─────────────────────────────────────────────
+// FAVORITES-API
+// ─────────────────────────────────────────────
+
 export const favoritesAPI = {
-  // Alle Favoriten eines Users (vorerst "anonymous")
-  async list(userId = "anonymous") {
+  async list() {
+    const user = await authAPI.getUser();
+    if (!user) return [];
+
     const { data, error } = await supabase
       .from("favorites")
       .select("recipe_id")
-      .eq("user_id", userId);
+      .eq("user_id", user.id);
     if (error) throw error;
     return (data || []).map((f) => f.recipe_id);
   },
 
-  // Favorit hinzufügen
-  async add(recipeId, userId = "anonymous") {
+  async add(recipeId) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+
     const { error } = await supabase
       .from("favorites")
-      .insert([{ recipe_id: recipeId, user_id: userId }]);
-    if (error && error.code !== "23505") throw error; // 23505 = duplicate, ignorieren
+      .insert([{ recipe_id: recipeId, user_id: user.id }]);
+    if (error && error.code !== "23505") throw error;
   },
 
-  // Favorit entfernen
-  async remove(recipeId, userId = "anonymous") {
+  async remove(recipeId) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+
     const { error } = await supabase
       .from("favorites")
       .delete()
       .eq("recipe_id", recipeId)
-      .eq("user_id", userId);
+      .eq("user_id", user.id);
     if (error) throw error;
   },
 };
 
+// ─────────────────────────────────────────────
+// STORAGE-API
+// ─────────────────────────────────────────────
+
 export const storageAPI = {
-  // Bild hochladen, gibt öffentliche URL zurück
   async uploadImage(file) {
     const ext = file.name.split(".").pop();
     const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 
     const { error: uploadError } = await supabase.storage
       .from("recipe-images")
-      .upload(fileName, file, {
-        cacheControl: "3600",
-        upsert: false,
-      });
+      .upload(fileName, file, { cacheControl: "3600", upsert: false });
 
     if (uploadError) throw uploadError;
 
@@ -130,7 +179,6 @@ export const storageAPI = {
     return data.publicUrl;
   },
 
-  // Bild löschen (anhand der vollen URL)
   async deleteImage(imageUrl) {
     if (!imageUrl || !imageUrl.includes("recipe-images")) return;
     try {

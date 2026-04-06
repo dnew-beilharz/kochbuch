@@ -5,8 +5,8 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { recipesAPI, favoritesAPI, storageAPI } from "./supabaseClient";
-
+import { recipesAPI, favoritesAPI, storageAPI, authAPI } from "./supabaseClient";
+import AuthScreen from "./AuthScreen";
 // ─── Kategorien & Schwierigkeitsgrade ───
 const CATEGORIES = {
   all:      { de: "Alle",           en: "All",            icon: "📚" },
@@ -28,6 +28,8 @@ const DIFFICULTIES = {
 // ═════════════════════════════════════════════
 export default function CookbookApp() {
   const [lang, setLang] = useState("de");
+  const [user, setUser] = useState(null);
+  const [authChecking, setAuthChecking] = useState(true);
   const [recipes, setRecipes] = useState([]);
   const [favorites, setFavorites] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -44,7 +46,25 @@ export default function CookbookApp() {
 
   // ─── Initial-Daten laden ───
   useEffect(() => {
-    loadData();
+    // Beim Start: prüfen ob User eingeloggt ist
+    authAPI.getUser().then((u) => {
+      setUser(u);
+      setAuthChecking(false);
+      if (u) loadData();
+    });
+
+    // Auf Auth-Änderungen lauschen (Login/Logout)
+    const subscription = authAPI.onAuthChange((u) => {
+      setUser(u);
+      if (u) {
+        loadData();
+      } else {
+        setRecipes([]);
+        setFavorites([]);
+      }
+    });
+
+    return () => subscription?.unsubscribe();
   }, []);
 
   const loadData = async () => {
@@ -115,6 +135,15 @@ export default function CookbookApp() {
     }
   };
 
+  const handleLogout = async () => {
+    try {
+      await authAPI.signOut();
+      showToast(lang === "de" ? "Abgemeldet" : "Logged out");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
   const toggleFavorite = async (id) => {
     const isFav = favorites.includes(id);
     try {
@@ -161,7 +190,21 @@ export default function CookbookApp() {
   const openNew = () => { setSelectedId(null); setView("form"); };
 
   // ─── Loading State ───
-  if (loading) {
+    // Auth-Check läuft noch
+  if (authChecking) {
+    return (
+      <div style={S.loadingScreen}>
+        <style>{globalCSS}</style>
+        <div style={S.loadingEmoji}>📖</div>
+        <p style={S.loadingText}>{lang === "de" ? "Wird geladen…" : "Loading…"}</p>
+      </div>
+    );
+  }
+
+  // Nicht eingeloggt → Login-Screen anzeigen
+  if (!user) {
+    return <AuthScreen onAuth={(u) => setUser(u)} />;
+  }if (loading) {
     return (
       <div style={S.loadingScreen}>
         <style>{globalCSS}</style>
@@ -244,6 +287,13 @@ export default function CookbookApp() {
               </button>
               <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>
                 {lang === "de" ? "🇬🇧 EN" : "🇩🇪 DE"}
+              </button>
+              <button
+                style={{ ...S.langToggle, background: "#D3232308", borderColor: "#D3232340", color: "#D32323" }}
+                onClick={handleLogout}
+                title={user?.email}
+              >
+                ⏻ {lang === "de" ? "Logout" : "Logout"}
               </button>
             </div>
           </header>
