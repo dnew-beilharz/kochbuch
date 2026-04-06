@@ -5,7 +5,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { recipesAPI, favoritesAPI, storageAPI, authAPI } from "./supabaseClient";
+import { supabase, recipesAPI, favoritesAPI, storageAPI, authAPI } from "./supabaseClient";
 import AuthScreen from "./AuthScreen";
 // ─── Kategorien & Schwierigkeitsgrade ───
 const CATEGORIES = {
@@ -45,7 +45,7 @@ export default function CookbookApp() {
   const [saving, setSaving] = useState(false);
 
   // ─── Initial-Daten laden ───
-  useEffect(() => {
+useEffect(() => {
     // Beim Start: prüfen ob User eingeloggt ist
     authAPI.getUser().then((u) => {
       setUser(u);
@@ -54,7 +54,7 @@ export default function CookbookApp() {
     });
 
     // Auf Auth-Änderungen lauschen (Login/Logout)
-    const subscription = authAPI.onAuthChange((u) => {
+    const authSubscription = authAPI.onAuthChange((u) => {
       setUser(u);
       if (u) {
         loadData();
@@ -64,7 +64,36 @@ export default function CookbookApp() {
       }
     });
 
-    return () => subscription?.unsubscribe();
+    // ─── Realtime-Subscription für Rezepte ───
+    // Lauscht auf Änderungen in der recipes-Tabelle und aktualisiert
+    // die App automatisch, wenn jemand etwas hinzufügt/ändert/löscht
+    const recipesChannel = supabase
+      .channel("recipes-changes")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "recipes" },
+        (payload) => {
+          console.log("Realtime-Update:", payload.eventType);
+          if (payload.eventType === "INSERT") {
+            setRecipes((prev) => {
+              if (prev.find((r) => r.id === payload.new.id)) return prev;
+              return [payload.new, ...prev];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            setRecipes((prev) =>
+              prev.map((r) => (r.id === payload.new.id ? payload.new : r))
+            );
+          } else if (payload.eventType === "DELETE") {
+            setRecipes((prev) => prev.filter((r) => r.id !== payload.old.id));
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      authSubscription?.unsubscribe();
+      supabase.removeChannel(recipesChannel);
+    };
   }, []);
 
   const loadData = async () => {
