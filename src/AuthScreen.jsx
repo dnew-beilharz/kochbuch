@@ -14,6 +14,7 @@ export default function AuthScreen({ onAuth }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(null);
+  const [showPassword, setShowPassword] = useState(false);
 
   const L = {
     welcome: lang === "de" ? "Willkommen!" : "Welcome!",
@@ -108,15 +109,27 @@ export default function AuthScreen({ onAuth }) {
 
           <div style={S.field}>
             <label style={S.label}>{L.password}</label>
-            <input
-              type="password"
-              style={S.input}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={L.passwordHint}
-              autoComplete={mode === "signin" ? "current-password" : "new-password"}
-              required
-            />
+            <div style={S.passwordWrap}>
+              <input
+                type={showPassword ? "text" : "password"}
+                style={{ ...S.input, paddingRight: 50 }}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={L.passwordHint}
+                autoComplete={mode === "signin" ? "current-password" : "new-password"}
+                required
+              />
+              <button
+                type="button"
+                style={S.eyeBtn}
+                onClick={() => setShowPassword(!showPassword)}
+                title={showPassword
+                  ? (lang === "de" ? "Verbergen" : "Hide")
+                  : (lang === "de" ? "Anzeigen" : "Show")}
+              >
+                {showPassword ? "🙈" : "👁️"}
+              </button>
+            </div>
           </div>
 
           {error && <div style={S.error}>⚠️ {error}</div>}
@@ -240,6 +253,23 @@ const S = {
     color: C.warm,
     background: "#fff",
     transition: "all 0.2s",
+  },
+  passwordWrap: {
+    position: "relative",
+    display: "flex",
+    alignItems: "center",
+  },
+  eyeBtn: {
+    position: "absolute",
+    right: 12,
+    background: "none",
+    border: "none",
+    cursor: "pointer",
+    fontSize: 20,
+    padding: "4px 8px",
+    opacity: 0.7,
+    transition: "opacity 0.15s",
+    lineHeight: 1,
   },
   error: {
     background: `${C.red}10`,
