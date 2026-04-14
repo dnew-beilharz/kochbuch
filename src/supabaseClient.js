@@ -157,3 +157,24 @@ export const storageAPI = {
     }
   },
 };
+// ─── IMPORT-API ───
+export const importAPI = {
+  async fromUrl(url) {
+    const response = await fetch(`${supabaseUrl}/functions/v1/import-recipe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${supabaseAnonKey}`,
+      },
+      body: JSON.stringify({ url }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Import fehlgeschlagen (${response.status})`);
+    }
+
+    const data = await response.json();
+    return data.recipe;
+  },
+};
