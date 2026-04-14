@@ -440,7 +440,7 @@ export default function CookbookApp() {
               </div>
             </div>
             <div style={S.headerRight}>
-              <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button
+              <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button>
               <button style={S.iconBtn} onClick={() => setImportOpen(true)} title={lang === "de" ? "Von URL importieren" : "Import from URL"}>
                 🔗 {lang === "de" ? "Importieren" : "Import"}
               </button>
