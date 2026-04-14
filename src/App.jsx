@@ -6,7 +6,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { supabase, recipesAPI, favoritesAPI, storageAPI, authAPI } from "./supabaseClient";
+import { supabase, recipesAPI, favoritesAPI, storageAPI, authAPI, importAPI } from "./supabaseClient";
 import AuthScreen from "./AuthScreen";
 
 const CATEGORIES = {
@@ -49,6 +49,10 @@ export default function CookbookApp() {
   const [saving, setSaving] = useState(false);
   const [shoppingSelection, setShoppingSelection] = useState([]);
   const [publicRecipe, setPublicRecipe] = useState(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importUrl, setImportUrl] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importedRecipe, setImportedRecipe] = useState(null);
 
   // Theme-Variablen
   const C = dark ? DARK : LIGHT;
@@ -225,6 +229,26 @@ export default function CookbookApp() {
     }
   };
 
+  const handleImport = async () => {
+    if (!importUrl.trim() || !importUrl.startsWith("http")) {
+      showToast(lang === "de" ? "Bitte gültige URL eingeben" : "Please enter a valid URL", "error");
+      return;
+    }
+    setImporting(true);
+    try {
+      const recipe = await importAPI.fromUrl(importUrl.trim());
+      setImportedRecipe(recipe);
+      setImportOpen(false);
+      setImportUrl("");
+      setSelectedId(null);
+      setView("form");
+      showToast(lang === "de" ? "Rezept geladen ✓ Bitte prüfen & speichern" : "Recipe loaded ✓ Please review & save");
+    } catch (err) {
+      showToast(err.message, "error");
+    } finally {
+      setImporting(false);
+    }
+  };
   const handleLogout = async () => {
     try {
       await authAPI.signOut();
@@ -347,7 +371,44 @@ export default function CookbookApp() {
         </div>
       )}
 
-      {deleteConfirm && (
+      {importOpen && (
+        <div style={S.overlay} onClick={() => !importing && setImportOpen(false)}>
+          <div style={{ ...S.modal, maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ fontFamily: font, margin: "0 0 8px", color: C.warm, fontSize: 22 }}>
+              🔗 {lang === "de" ? "Rezept importieren" : "Import Recipe"}
+            </h2>
+            <p style={{ color: C.soft, fontSize: 14, marginTop: 0, marginBottom: 16, fontStyle: "italic" }}>
+              {lang === "de"
+                ? "URL einer Rezeptseite einfügen (z.B. Chefkoch, BBC Good Food). Funktioniert mit den meisten großen Rezeptseiten."
+                : "Paste a recipe URL (e.g. Chefkoch, BBC Good Food). Works with most popular recipe sites."}
+            </p>
+            <input
+              style={S.input}
+              type="url"
+              value={importUrl}
+              onChange={(e) => setImportUrl(e.target.value)}
+              placeholder="https://www.chefkoch.de/rezepte/..."
+              disabled={importing}
+              autoFocus
+              onKeyDown={(e) => e.key === "Enter" && !importing && handleImport()}
+            />
+            <div style={{ ...S.modalBtns, marginTop: 20 }}>
+              <button style={S.modalCancel} onClick={() => setImportOpen(false)} disabled={importing}>
+                {lang === "de" ? "Abbrechen" : "Cancel"}
+              </button>
+              <button
+                style={{ ...S.saveBtn, padding: "10px 24px", opacity: importing ? 0.6 : 1 }}
+                onClick={handleImport}
+                disabled={importing}
+              >
+                {importing
+                  ? (lang === "de" ? "Lädt…" : "Loading…")
+                  : (lang === "de" ? "Importieren" : "Import")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}{deleteConfirm && (
         <div style={S.overlay} onClick={() => setDeleteConfirm(null)}>
           <div style={S.modal} onClick={(e) => e.stopPropagation()}>
             <p style={S.modalText}>
@@ -379,7 +440,10 @@ export default function CookbookApp() {
               </div>
             </div>
             <div style={S.headerRight}>
-              <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button>
+              <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button><button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button>
+              <button style={S.iconBtn} onClick={() => setImportOpen(true)} title={lang === "de" ? "Von URL importieren" : "Import from URL"}>
+                🔗 {lang === "de" ? "Importieren" : "Import"}
+              </button>
               <button style={S.iconBtn} onClick={() => setView("shopping")} title={lang === "de" ? "Einkaufsliste" : "Shopping"}>
                 🛒 {shoppingSelection.length > 0 && <span style={S.badge}>{shoppingSelection.length}</span>}
               </button>
@@ -491,8 +555,9 @@ export default function CookbookApp() {
       {(view === "form" || view === "edit") && (
         <RecipeForm
           lang={lang} setLang={setLang}
-          recipe={view === "edit" ? selectedRecipe : null}
-          onSave={saveRecipe} onCancel={() => setView("list")}
+          recipe={view === "edit" ? selectedRecipe : importedRecipe}
+          onSave={(r) => { saveRecipe(r); setImportedRecipe(null); }}
+          onCancel={() => { setView("list"); setImportedRecipe(null); }}
           saving={saving} showToast={showToast} C={C} S={S}
         />
       )}
