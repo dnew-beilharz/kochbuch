@@ -1,7 +1,5 @@
 // src/supabaseClient.js
-// ─────────────────────────────────────────────
-// Supabase-Client mit Auth + Public-Sharing
-// ─────────────────────────────────────────────
+// Kochbuch-System mit privaten/öffentlichen Bereichen + Anfragen
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -46,6 +44,43 @@ export const authAPI = {
   },
 };
 
+// ─── PROFILES ───
+export const profilesAPI = {
+  async list() {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, role, cookbook_visibility, display_name");
+    if (error) throw error;
+    return data || [];
+  },
+  async get(userId) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, role, cookbook_visibility, display_name")
+      .eq("id", userId)
+      .single();
+    if (error) throw error;
+    return data;
+  },
+  async getMine() {
+    const user = await authAPI.getUser();
+    if (!user) return null;
+    return await this.get(user.id);
+  },
+  async updateMine(updates) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+    const { data, error } = await supabase
+      .from("profiles")
+      .update(updates)
+      .eq("id", user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  },
+};
+
 // ─── RECIPES ───
 export const recipesAPI = {
   async list() {
@@ -63,13 +98,12 @@ export const recipesAPI = {
     return data;
   },
 
-  // Öffentliches Rezept ohne Auth abrufen
   async getPublic(id) {
     const { data, error } = await supabase
       .from("recipes")
       .select("*")
       .eq("id", id)
-      .eq("is_public", true)
+      .eq("visibility", "public")
       .single();
     if (error) throw error;
     return data;
@@ -98,14 +132,46 @@ export const recipesAPI = {
     if (error) throw error;
   },
 
-  // Toggle is_public Flag
-  async setPublic(id, isPublic) {
+  // Visibility ändern (private ↔ public)
+  async setVisibility(id, visibility) {
     const { data, error } = await supabase
       .from("recipes")
-      .update({ is_public: isPublic })
+      .update({ visibility })
       .eq("id", id)
       .select()
       .single();
+    if (error) throw error;
+    return data;
+  },
+
+  // Rezept ins öffentliche Kochbuch hochladen (= Kopie mit visibility=public)
+  async uploadToPublic(recipe) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+    const copy = { ...recipe };
+    delete copy.id;
+    delete copy.created_at;
+    delete copy.updated_at;
+    copy.user_id = user.id;
+    copy.visibility = "public";
+    copy.copied_from = recipe.id;
+    const { data, error } = await supabase.from("recipes").insert([copy]).select().single();
+    if (error) throw error;
+    return data;
+  },
+
+  // Eigene Kopie eines Rezepts erstellen (privat)
+  async copyToMine(recipe) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+    const copy = { ...recipe };
+    delete copy.id;
+    delete copy.created_at;
+    delete copy.updated_at;
+    copy.user_id = user.id;
+    copy.visibility = "private";
+    copy.copied_from = recipe.id;
+    const { data, error } = await supabase.from("recipes").insert([copy]).select().single();
     if (error) throw error;
     return data;
   },
@@ -134,6 +200,118 @@ export const favoritesAPI = {
   },
 };
 
+// ─── REQUESTS (Übernahme-Anfragen) ───
+export const requestsAPI = {
+  // Eingehende Anfragen (für Owner)
+  async listIncoming() {
+    const user = await authAPI.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("recipe_requests")
+      .select(`
+        id, status, message, created_at, responded_at,
+        recipe_id, requester_id,
+        recipes (id, title_de, title_en, image_url, emoji),
+        requester:profiles!recipe_requests_requester_id_fkey (id, email, display_name)
+      `)
+      .eq("owner_id", user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  // Ausgehende Anfragen (für Requester)
+  async listOutgoing() {
+    const user = await authAPI.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("recipe_requests")
+      .select(`
+        id, status, message, created_at, responded_at,
+        recipe_id, owner_id,
+        recipes (id, title_de, title_en, image_url, emoji),
+        owner:profiles!recipe_requests_owner_id_fkey (id, email, display_name)
+      `)
+      .eq("requester_id", user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async create(recipeId, ownerId, message = null) {
+    const user = await authAPI.getUser();
+    if (!user) throw new Error("Nicht eingeloggt");
+    if (user.id === ownerId) throw new Error("Eigene Rezepte musst du nicht anfragen");
+
+    const { data, error } = await supabase
+      .from("recipe_requests")
+      .insert([{
+        recipe_id: recipeId,
+        requester_id: user.id,
+        owner_id: ownerId,
+        message,
+        status: "pending",
+      }])
+      .select()
+      .single();
+    if (error) {
+      if (error.code === "23505") throw new Error("Du hast für dieses Rezept bereits eine Anfrage gestellt");
+      throw error;
+    }
+    return data;
+  },
+
+  async accept(requestId) {
+    // 1. Request laden
+    const { data: req, error: reqErr } = await supabase
+      .from("recipe_requests")
+      .select("recipe_id, requester_id, owner_id")
+      .eq("id", requestId)
+      .single();
+    if (reqErr) throw reqErr;
+
+    // 2. Rezept laden
+    const { data: recipe, error: recErr } = await supabase
+      .from("recipes")
+      .select("*")
+      .eq("id", req.recipe_id)
+      .single();
+    if (recErr) throw recErr;
+
+    // 3. Kopie für den Requester anlegen
+    const copy = { ...recipe };
+    delete copy.id;
+    delete copy.created_at;
+    delete copy.updated_at;
+    copy.user_id = req.requester_id;
+    copy.visibility = "private";
+    copy.copied_from = recipe.id;
+
+    const { error: insErr } = await supabase.from("recipes").insert([copy]);
+    if (insErr) throw insErr;
+
+    // 4. Request auf "accepted" setzen
+    const { error: updErr } = await supabase
+      .from("recipe_requests")
+      .update({ status: "accepted", responded_at: new Date().toISOString() })
+      .eq("id", requestId);
+    if (updErr) throw updErr;
+  },
+
+  async reject(requestId) {
+    const { error } = await supabase
+      .from("recipe_requests")
+      .update({ status: "rejected", responded_at: new Date().toISOString() })
+      .eq("id", requestId);
+    if (error) throw error;
+  },
+
+  async cancel(requestId) {
+    const { error } = await supabase.from("recipe_requests").delete().eq("id", requestId);
+    if (error) throw error;
+  },
+};
+
 // ─── STORAGE ───
 export const storageAPI = {
   async uploadImage(file) {
@@ -157,7 +335,8 @@ export const storageAPI = {
     }
   },
 };
-// ─── IMPORT-API ───
+
+// ─── IMPORT (URL → Rezept) ───
 export const importAPI = {
   async fromUrl(url) {
     const response = await fetch(`${supabaseUrl}/functions/v1/import-recipe`, {
@@ -168,12 +347,10 @@ export const importAPI = {
       },
       body: JSON.stringify({ url }),
     });
-
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(errorData.error || `Import fehlgeschlagen (${response.status})`);
     }
-
     const data = await response.json();
     return data.recipe;
   },
