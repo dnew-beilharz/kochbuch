@@ -1,12 +1,10 @@
 // src/App.jsx
 // ═══════════════════════════════════════════════════════════════
-//  🍳 MEIN KOCHBUCH — Full Featured
-//  Features: CRUD, Auth, Realtime, Dark Mode, Public Share,
-//  Duplicate, Print, Shopping List
+//  🍳 MEIN KOCHBUCH — mit privaten/öffentlichen Bereichen + Anfragen
 // ═══════════════════════════════════════════════════════════════
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { supabase, recipesAPI, favoritesAPI, storageAPI, authAPI, importAPI } from "./supabaseClient";
+import { supabase, recipesAPI, favoritesAPI, storageAPI, authAPI, importAPI, profilesAPI, requestsAPI } from "./supabaseClient";
 import AuthScreen from "./AuthScreen";
 
 const CATEGORIES = {
@@ -24,6 +22,14 @@ const DIFFICULTIES = {
   hard:   { de: "Schwer",  en: "Hard",   icon: "🔴" },
 };
 
+// Helper: Anzeigename eines Users (Display-Name oder Email-Prefix)
+function userLabel(profile) {
+  if (!profile) return "?";
+  if (profile.display_name) return profile.display_name;
+  if (profile.email) return profile.email.split("@")[0];
+  return "User";
+}
+
 // ═════════════════════════════════════════════
 //  MAIN APP
 // ═════════════════════════════════════════════
@@ -33,12 +39,21 @@ export default function CookbookApp() {
     try { return localStorage.getItem("cb_dark") === "1"; } catch { return false; }
   });
   const [user, setUser] = useState(null);
+  const [myProfile, setMyProfile] = useState(null);
+  const [profiles, setProfiles] = useState([]); // alle User-Profile
   const [authChecking, setAuthChecking] = useState(true);
   const [recipes, setRecipes] = useState([]);
   const [favorites, setFavorites] = useState([]);
+  const [requests, setRequests] = useState({ incoming: [], outgoing: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [view, setView] = useState("list"); // list | detail | form | edit | shopping | publicShare
+
+  // Hauptbereich-Tab: 'mine' | 'public' | 'others'
+  const [section, setSection] = useState("mine");
+  // Wenn 'others': welcher User wird gerade angeschaut
+  const [viewingUser, setViewingUser] = useState(null);
+
+  const [view, setView] = useState("list"); // list | detail | form | edit | shopping | settings | requests | publicShare
   const [selectedId, setSelectedId] = useState(null);
   const [search, setSearch] = useState("");
   const [catFilter, setCatFilter] = useState("all");
@@ -53,18 +68,18 @@ export default function CookbookApp() {
   const [importUrl, setImportUrl] = useState("");
   const [importing, setImporting] = useState(false);
   const [importedRecipe, setImportedRecipe] = useState(null);
+  const [requestModal, setRequestModal] = useState(null); // { recipe, owner }
+  const [requestMessage, setRequestMessage] = useState("");
 
-  // Theme-Variablen
   const C = dark ? DARK : LIGHT;
+  const S = makeStyles(C);
 
-  // Dark-Mode Persistenz
   useEffect(() => {
     try { localStorage.setItem("cb_dark", dark ? "1" : "0"); } catch {}
     document.body.style.background = C.bg1;
   }, [dark, C.bg1]);
 
-  // ─── Public-Share Handling ───
-  // URL-Format: #/share/RECIPE-ID → zeigt Rezept ohne Login
+  // Public Share Handling
   useEffect(() => {
     const checkHash = async () => {
       const hash = window.location.hash;
@@ -75,7 +90,7 @@ export default function CookbookApp() {
           setPublicRecipe(r);
           setView("publicShare");
           setAuthChecking(false);
-        } catch (err) {
+        } catch {
           setPublicRecipe("notfound");
           setView("publicShare");
           setAuthChecking(false);
@@ -87,23 +102,23 @@ export default function CookbookApp() {
     return () => window.removeEventListener("hashchange", checkHash);
   }, []);
 
-  // ─── Auth + Daten laden ───
+  // Auth + Daten laden
   useEffect(() => {
     if (window.location.hash.startsWith("#/share/")) return;
 
     authAPI.getUser().then((u) => {
       setUser(u);
       setAuthChecking(false);
-      if (u) loadData();
+      if (u) loadAll();
     });
 
-    const authSubscription = authAPI.onAuthChange((u) => {
+    const authSub = authAPI.onAuthChange((u) => {
       setUser(u);
-      if (u) loadData();
-      else { setRecipes([]); setFavorites([]); }
+      if (u) loadAll();
+      else { setRecipes([]); setFavorites([]); setProfiles([]); setMyProfile(null); }
     });
 
-    // Realtime
+    // Realtime: Rezepte
     const recipesChannel = supabase
       .channel("recipes-changes")
       .on("postgres_changes", { event: "*", schema: "public", table: "recipes" }, (payload) => {
@@ -117,23 +132,52 @@ export default function CookbookApp() {
       })
       .subscribe();
 
+    // Realtime: Anfragen
+    const requestsChannel = supabase
+      .channel("requests-changes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "recipe_requests" }, () => {
+        loadRequests();
+      })
+      .subscribe();
+
     return () => {
-      authSubscription?.unsubscribe();
+      authSub?.unsubscribe();
       supabase.removeChannel(recipesChannel);
+      supabase.removeChannel(requestsChannel);
     };
   }, []);
 
-  const loadData = async () => {
+  const loadAll = async () => {
     setLoading(true);
     setError(null);
     try {
-      const [recipesData, favsData] = await Promise.all([recipesAPI.list(), favoritesAPI.list()]);
+      const [recipesData, favsData, profilesData, myProf] = await Promise.all([
+        recipesAPI.list(),
+        favoritesAPI.list(),
+        profilesAPI.list(),
+        profilesAPI.getMine(),
+      ]);
       setRecipes(recipesData);
       setFavorites(favsData);
+      setProfiles(profilesData);
+      setMyProfile(myProf);
+      await loadRequests();
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadRequests = async () => {
+    try {
+      const [incoming, outgoing] = await Promise.all([
+        requestsAPI.listIncoming(),
+        requestsAPI.listOutgoing(),
+      ]);
+      setRequests({ incoming, outgoing });
+    } catch (err) {
+      console.error("loadRequests error:", err);
     }
   };
 
@@ -185,11 +229,23 @@ export default function CookbookApp() {
         setFavorites((prev) => [...prev, id]);
       }
     } catch (err) {
-      showToast((lang === "de" ? "Fehler: " : "Error: ") + err.message, "error");
+      showToast(err.message, "error");
     }
   };
 
-  // ─── Duplizieren ───
+  // Öffentlich machen / wieder privat
+  const setVisibility = async (recipe, visibility) => {
+    try {
+      await recipesAPI.setVisibility(recipe.id, visibility);
+      showToast(visibility === "public"
+        ? (lang === "de" ? "Im öffentlichen Kochbuch ✓" : "Now in public cookbook ✓")
+        : (lang === "de" ? "Wieder privat" : "Now private"));
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  // Eigene Kopie aus eigenem öffentlichen Rezept
   const duplicateRecipe = async (recipe) => {
     try {
       const copy = { ...recipe };
@@ -199,56 +255,80 @@ export default function CookbookApp() {
       delete copy.user_id;
       copy.title_de = recipe.title_de + (lang === "de" ? " (Kopie)" : " (Copy)");
       if (recipe.title_en) copy.title_en = recipe.title_en + (lang === "de" ? " (Kopie)" : " (Copy)");
-      copy.is_public = false; // Kopien sind standardmäßig privat
+      copy.visibility = "private";
       await recipesAPI.create(copy);
       showToast(lang === "de" ? "Rezept dupliziert ✓" : "Recipe duplicated ✓");
       setView("list");
     } catch (err) {
-      showToast((lang === "de" ? "Fehler: " : "Error: ") + err.message, "error");
+      showToast(err.message, "error");
     }
   };
 
-  // ─── Public Toggle ───
-  const togglePublic = async (recipe) => {
+  // Aus öffentlichem Bereich in eigenes übernehmen (sofort)
+  const copyToMine = async (recipe) => {
     try {
-      const updated = await recipesAPI.setPublic(recipe.id, !recipe.is_public);
-      setRecipes((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
-      if (updated.is_public) {
-        const url = `${window.location.origin}${window.location.pathname}#/share/${updated.id}`;
-        try {
-          await navigator.clipboard.writeText(url);
-          showToast(lang === "de" ? "Link kopiert! 🔗" : "Link copied! 🔗");
-        } catch {
-          showToast(lang === "de" ? "Öffentlich gemacht ✓" : "Made public ✓");
-        }
-      } else {
-        showToast(lang === "de" ? "Privat gemacht" : "Made private");
-      }
-    } catch (err) {
-      showToast((lang === "de" ? "Fehler: " : "Error: ") + err.message, "error");
-    }
-  };
-
-  const handleImport = async () => {
-    if (!importUrl.trim() || !importUrl.startsWith("http")) {
-      showToast(lang === "de" ? "Bitte gültige URL eingeben" : "Please enter a valid URL", "error");
-      return;
-    }
-    setImporting(true);
-    try {
-      const recipe = await importAPI.fromUrl(importUrl.trim());
-      setImportedRecipe(recipe);
-      setImportOpen(false);
-      setImportUrl("");
-      setSelectedId(null);
-      setView("form");
-      showToast(lang === "de" ? "Rezept geladen ✓ Bitte prüfen & speichern" : "Recipe loaded ✓ Please review & save");
+      await recipesAPI.copyToMine(recipe);
+      showToast(lang === "de" ? "In dein Kochbuch übernommen ✓" : "Added to your cookbook ✓");
+      setSection("mine");
+      setView("list");
     } catch (err) {
       showToast(err.message, "error");
-    } finally {
-      setImporting(false);
     }
   };
+
+  // Aus fremdem privaten Kochbuch: Anfrage stellen
+  const requestRecipe = async (recipe) => {
+    try {
+      const owner = profiles.find((p) => p.id === recipe.user_id);
+      setRequestModal({ recipe, owner });
+      setRequestMessage("");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const sendRequest = async () => {
+    if (!requestModal) return;
+    try {
+      await requestsAPI.create(requestModal.recipe.id, requestModal.recipe.user_id, requestMessage.trim() || null);
+      showToast(lang === "de" ? "Anfrage gesendet ✓" : "Request sent ✓");
+      setRequestModal(null);
+      setRequestMessage("");
+      await loadRequests();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const acceptRequest = async (reqId) => {
+    try {
+      await requestsAPI.accept(reqId);
+      showToast(lang === "de" ? "Anfrage angenommen ✓" : "Request accepted ✓");
+      await loadRequests();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const rejectRequest = async (reqId) => {
+    try {
+      await requestsAPI.reject(reqId);
+      showToast(lang === "de" ? "Anfrage abgelehnt" : "Request rejected");
+      await loadRequests();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const cancelRequest = async (reqId) => {
+    try {
+      await requestsAPI.cancel(reqId);
+      await loadRequests();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await authAPI.signOut();
@@ -258,29 +338,96 @@ export default function CookbookApp() {
     }
   };
 
-  // ─── Shopping List ───
+  // Sichtbarkeit des eigenen Kochbuchs ändern
+  const toggleMyCookbookVisibility = async () => {
+    try {
+      const newVis = myProfile.cookbook_visibility === "visible" ? "hidden" : "visible";
+      const updated = await profilesAPI.updateMine({ cookbook_visibility: newVis });
+      setMyProfile(updated);
+      showToast(newVis === "visible"
+        ? (lang === "de" ? "Dein Kochbuch ist nun einsehbar" : "Your cookbook is now visible")
+        : (lang === "de" ? "Dein Kochbuch ist nun nur Teaser-sichtbar" : "Only teasers visible now"));
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
+  const updateDisplayName = async (name) => {
+    try {
+      const updated = await profilesAPI.updateMine({ display_name: name.trim() || null });
+      setMyProfile(updated);
+      // profiles-Liste auch aktualisieren
+      setProfiles((prev) => prev.map((p) => p.id === updated.id ? { ...p, display_name: updated.display_name } : p));
+      showToast(lang === "de" ? "Name aktualisiert ✓" : "Name updated ✓");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  };
+
   const toggleShoppingItem = (id) => {
     setShoppingSelection((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
   };
 
-  // ─── Filtering ───
+  // ─── Filter-Logik (welche Rezepte zeigen wir?) ───
+  // Bestimmt, welche Rezepte im aktuellen Bereich angezeigt werden
+  const sectionRecipes = useMemo(() => {
+    if (!user) return [];
+    if (section === "mine") {
+      return recipes.filter((r) => r.user_id === user.id && r.visibility === "private");
+    }
+    if (section === "public") {
+      return recipes.filter((r) => r.visibility === "public");
+    }
+    if (section === "others") {
+      // Bei einem spezifischen User: dessen private Rezepte
+      if (viewingUser) {
+        return recipes.filter((r) => r.user_id === viewingUser.id && r.visibility === "private" && r.user_id !== user.id);
+      }
+      return [];
+    }
+    return [];
+  }, [recipes, section, user, viewingUser]);
+
+  // Suche/Filter darauf anwenden
   const filtered = useMemo(() => {
-    return recipes.filter((r) => {
+    return sectionRecipes.filter((r) => {
       const s = search.toLowerCase();
       const matchSearch = !s
         || (r.title_de || "").toLowerCase().includes(s)
         || (r.title_en || "").toLowerCase().includes(s)
-        || (r.tags || []).some((t) => t.toLowerCase().includes(s))
-        || (r.ingredients || []).some((i) =>
-            (i.name_de || "").toLowerCase().includes(s) ||
-            (i.name_en || "").toLowerCase().includes(s));
+        || (r.tags || []).some((t) => t.toLowerCase().includes(s));
       const matchCat = catFilter === "all" || r.category === catFilter;
       const matchFav = !showFavsOnly || favorites.includes(r.id);
       return matchSearch && matchCat && matchFav;
     });
-  }, [recipes, search, catFilter, showFavsOnly, favorites]);
+  }, [sectionRecipes, search, catFilter, showFavsOnly, favorites]);
+
+  // Liste der anderen User (mit ihren Rezept-Anzahlen)
+  const otherUsers = useMemo(() => {
+    if (!user) return [];
+    const counts = {};
+    recipes.forEach((r) => {
+      if (r.visibility === "private" && r.user_id !== user.id) {
+        counts[r.user_id] = (counts[r.user_id] || 0) + 1;
+      }
+    });
+    return profiles
+      .filter((p) => p.id !== user.id && counts[p.id] > 0)
+      .map((p) => ({ ...p, recipeCount: counts[p.id] }));
+  }, [profiles, recipes, user]);
 
   const selectedRecipe = recipes.find((r) => r.id === selectedId);
+  const isMyRecipe = selectedRecipe && selectedRecipe.user_id === user?.id;
+  const isAdmin = myProfile?.role === "admin";
+  const canEdit = isMyRecipe || isAdmin;
+
+  // Wird das aktuelle Detail-Rezept "versteckt" (Owner hat hidden)?
+  const detailOwner = selectedRecipe ? profiles.find((p) => p.id === selectedRecipe.user_id) : null;
+  const isHiddenForMe = selectedRecipe
+    && !isMyRecipe
+    && !isAdmin
+    && selectedRecipe.visibility === "private"
+    && detailOwner?.cookbook_visibility === "hidden";
 
   const openDetail = (id) => {
     setSelectedId(id);
@@ -291,10 +438,9 @@ export default function CookbookApp() {
   const openEdit = (id) => { setSelectedId(id); setView("edit"); };
   const openNew = () => { setSelectedId(null); setView("form"); };
 
-  // ─── Styles für Theme ───
-  const S = makeStyles(C);
+  const pendingIncoming = requests.incoming.filter((r) => r.status === "pending").length;
 
-  // ─── Public Share View (ohne Auth) ───
+  // ─── Public Share (ohne Auth) ───
   if (view === "publicShare") {
     return (
       <div style={S.app}>
@@ -302,51 +448,25 @@ export default function CookbookApp() {
         {publicRecipe === "notfound" ? (
           <div style={S.errorScreen}>
             <div style={{ fontSize: 64 }}>🔒</div>
-            <h2 style={S.errorTitle}>
-              {lang === "de" ? "Rezept nicht verfügbar" : "Recipe not available"}
-            </h2>
-            <p style={S.errorText}>
-              {lang === "de"
-                ? "Dieses Rezept ist privat oder existiert nicht."
-                : "This recipe is private or doesn't exist."}
-            </p>
-            <a href={window.location.pathname} style={S.retryBtn}>
-              {lang === "de" ? "Zum Kochbuch" : "Go to cookbook"}
-            </a>
+            <h2 style={S.errorTitle}>{lang === "de" ? "Rezept nicht verfügbar" : "Not available"}</h2>
+            <a href={window.location.pathname} style={S.retryBtn}>{lang === "de" ? "Zum Kochbuch" : "To cookbook"}</a>
           </div>
         ) : publicRecipe ? (
           <PublicRecipeView recipe={publicRecipe} lang={lang} setLang={setLang} C={C} S={S} dark={dark} setDark={setDark} />
         ) : (
-          <div style={S.loadingScreen}>
-            <div style={S.loadingEmoji}>📖</div>
-          </div>
+          <div style={S.loadingScreen}><div style={S.loadingEmoji}>📖</div></div>
         )}
       </div>
     );
   }
 
   if (authChecking) {
-    return (
-      <div style={S.loadingScreen}>
-        <style>{globalCSS(C)}</style>
-        <div style={S.loadingEmoji}>📖</div>
-        <p style={S.loadingText}>{lang === "de" ? "Wird geladen…" : "Loading…"}</p>
-      </div>
-    );
+    return <div style={S.loadingScreen}><style>{globalCSS(C)}</style><div style={S.loadingEmoji}>📖</div><p style={S.loadingText}>{lang === "de" ? "Wird geladen…" : "Loading…"}</p></div>;
   }
-
   if (!user) return <AuthScreen onAuth={(u) => setUser(u)} />;
-
   if (loading) {
-    return (
-      <div style={S.loadingScreen}>
-        <style>{globalCSS(C)}</style>
-        <div style={S.loadingEmoji}>📖</div>
-        <p style={S.loadingText}>{lang === "de" ? "Kochbuch wird geladen…" : "Loading cookbook…"}</p>
-      </div>
-    );
+    return <div style={S.loadingScreen}><style>{globalCSS(C)}</style><div style={S.loadingEmoji}>📖</div><p style={S.loadingText}>{lang === "de" ? "Kochbuch wird geladen…" : "Loading cookbook…"}</p></div>;
   }
-
   if (error) {
     return (
       <div style={S.errorScreen}>
@@ -354,33 +474,69 @@ export default function CookbookApp() {
         <div style={{ fontSize: 64 }}>⚠️</div>
         <h2 style={S.errorTitle}>{lang === "de" ? "Verbindungsfehler" : "Connection Error"}</h2>
         <p style={S.errorText}>{error}</p>
-        <button style={S.retryBtn} onClick={loadData}>
-          {lang === "de" ? "Erneut versuchen" : "Retry"}
-        </button>
+        <button style={S.retryBtn} onClick={loadAll}>{lang === "de" ? "Erneut versuchen" : "Retry"}</button>
       </div>
     );
   }
+
+  // Section-Titel
+  const sectionTitle = section === "mine"
+    ? (lang === "de" ? "Mein Kochbuch" : "My Cookbook")
+    : section === "public"
+      ? (lang === "de" ? "Öffentliches Kochbuch" : "Public Cookbook")
+      : viewingUser
+        ? `${userLabel(viewingUser)}${lang === "de" ? "s Kochbuch" : "'s Cookbook"}`
+        : (lang === "de" ? "Andere Kochbücher" : "Other Cookbooks");
 
   return (
     <div style={S.app}>
       <style>{globalCSS(C)}</style>
 
-      {toast && (
-        <div style={{ ...S.toast, background: toast.type === "error" ? "#C0392B" : C.warm }}>
-          {toast.msg}
+      {toast && <div style={{ ...S.toast, background: toast.type === "error" ? "#C0392B" : C.warm }}>{toast.msg}</div>}
+
+      {deleteConfirm && (
+        <div style={S.overlay} onClick={() => setDeleteConfirm(null)}>
+          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+            <p style={S.modalText}>{lang === "de" ? "Dieses Rezept wirklich löschen?" : "Really delete?"}</p>
+            <div style={S.modalBtns}>
+              <button style={S.modalCancel} onClick={() => setDeleteConfirm(null)}>{lang === "de" ? "Abbrechen" : "Cancel"}</button>
+              <button style={S.modalDelete} onClick={() => deleteRecipe(deleteConfirm)}>{lang === "de" ? "Löschen" : "Delete"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {requestModal && (
+        <div style={S.overlay} onClick={() => setRequestModal(null)}>
+          <div style={{ ...S.modal, maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ fontFamily: font, color: C.warm, margin: "0 0 4px", fontSize: 22 }}>
+              📥 {lang === "de" ? "Rezept anfragen" : "Request recipe"}
+            </h2>
+            <p style={{ color: C.soft, fontSize: 14, fontStyle: "italic", margin: "0 0 16px" }}>
+              {lang === "de" ? "Anfrage an" : "Request to"} <b>{userLabel(requestModal.owner)}</b>
+              {" "}{lang === "de" ? "für" : "for"} <b>{lang === "de" ? requestModal.recipe.title_de : (requestModal.recipe.title_en || requestModal.recipe.title_de)}</b>
+            </p>
+            <textarea
+              style={{ ...S.textarea, minHeight: 80 }}
+              value={requestMessage}
+              onChange={(e) => setRequestMessage(e.target.value)}
+              placeholder={lang === "de" ? "Kurze Nachricht (optional)…" : "Short message (optional)…"}
+              autoFocus
+            />
+            <div style={{ ...S.modalBtns, marginTop: 16 }}>
+              <button style={S.modalCancel} onClick={() => setRequestModal(null)}>{lang === "de" ? "Abbrechen" : "Cancel"}</button>
+              <button style={{ ...S.saveBtn, padding: "10px 24px" }} onClick={sendRequest}>📤 {lang === "de" ? "Anfrage senden" : "Send request"}</button>
+            </div>
+          </div>
         </div>
       )}
 
       {importOpen && (
         <div style={S.overlay} onClick={() => !importing && setImportOpen(false)}>
           <div style={{ ...S.modal, maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ fontFamily: font, margin: "0 0 8px", color: C.warm, fontSize: 22 }}>
-              🔗 {lang === "de" ? "Rezept importieren" : "Import Recipe"}
-            </h2>
+            <h2 style={{ fontFamily: font, margin: "0 0 8px", color: C.warm, fontSize: 22 }}>🔗 {lang === "de" ? "Rezept importieren" : "Import Recipe"}</h2>
             <p style={{ color: C.soft, fontSize: 14, marginTop: 0, marginBottom: 16, fontStyle: "italic" }}>
-              {lang === "de"
-                ? "URL einer Rezeptseite einfügen (z.B. Chefkoch, BBC Good Food). Funktioniert mit den meisten großen Rezeptseiten."
-                : "Paste a recipe URL (e.g. Chefkoch, BBC Good Food). Works with most popular recipe sites."}
+              {lang === "de" ? "URL einer Rezeptseite einfügen (z.B. Chefkoch)." : "Paste a recipe URL (e.g. Chefkoch)."}
             </p>
             <input
               style={S.input}
@@ -393,145 +549,203 @@ export default function CookbookApp() {
               onKeyDown={(e) => e.key === "Enter" && !importing && handleImport()}
             />
             <div style={{ ...S.modalBtns, marginTop: 20 }}>
-              <button style={S.modalCancel} onClick={() => setImportOpen(false)} disabled={importing}>
-                {lang === "de" ? "Abbrechen" : "Cancel"}
-              </button>
-              <button
-                style={{ ...S.saveBtn, padding: "10px 24px", opacity: importing ? 0.6 : 1 }}
-                onClick={handleImport}
-                disabled={importing}
-              >
-                {importing
-                  ? (lang === "de" ? "Lädt…" : "Loading…")
-                  : (lang === "de" ? "Importieren" : "Import")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}{deleteConfirm && (
-        <div style={S.overlay} onClick={() => setDeleteConfirm(null)}>
-          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
-            <p style={S.modalText}>
-              {lang === "de" ? "Dieses Rezept wirklich löschen?" : "Really delete this recipe?"}
-            </p>
-            <div style={S.modalBtns}>
-              <button style={S.modalCancel} onClick={() => setDeleteConfirm(null)}>
-                {lang === "de" ? "Abbrechen" : "Cancel"}
-              </button>
-              <button style={S.modalDelete} onClick={() => deleteRecipe(deleteConfirm)}>
-                {lang === "de" ? "Löschen" : "Delete"}
+              <button style={S.modalCancel} onClick={() => setImportOpen(false)} disabled={importing}>{lang === "de" ? "Abbrechen" : "Cancel"}</button>
+              <button style={{ ...S.saveBtn, padding: "10px 24px", opacity: importing ? 0.6 : 1 }} onClick={handleImport} disabled={importing}>
+                {importing ? (lang === "de" ? "Lädt…" : "Loading…") : (lang === "de" ? "Importieren" : "Import")}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ─── LIST ─── */}
+      {/* ─── HEADER mit Section-Tabs ─── */}
       {view === "list" && (
         <>
           <header style={S.header}>
             <div style={S.headerLeft}>
               <span style={S.logo}>📖</span>
               <div>
-                <h1 style={S.title}>{lang === "de" ? "Mein Kochbuch" : "My Cookbook"}</h1>
+                <h1 style={S.title}>{sectionTitle}</h1>
                 <p style={S.subtitle}>
-                  {lang === "de" ? `${recipes.length} Rezepte in deiner Sammlung` : `${recipes.length} recipes in your collection`}
+                  {viewingUser
+                    ? `${filtered.length} ${lang === "de" ? "Rezepte" : "recipes"}`
+                    : `${sectionRecipes.length} ${lang === "de" ? "Rezepte" : "recipes"}`}
                 </p>
               </div>
             </div>
             <div style={S.headerRight}>
-              <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neues Rezept" : "New"}</button>
-              <button style={S.iconBtn} onClick={() => setImportOpen(true)} title={lang === "de" ? "Von URL importieren" : "Import from URL"}>
-                🔗 {lang === "de" ? "Importieren" : "Import"}
+              {section === "mine" && (
+                <button style={S.addBtn} onClick={openNew}>+ {lang === "de" ? "Neu" : "New"}</button>
+              )}
+              {section === "mine" && (
+                <button style={S.iconBtn} onClick={() => setImportOpen(true)} title={lang === "de" ? "Importieren" : "Import"}>🔗</button>
+              )}
+              <button style={S.iconBtn} onClick={() => setView("requests")} title={lang === "de" ? "Anfragen" : "Requests"}>
+                📬 {pendingIncoming > 0 && <span style={S.badge}>{pendingIncoming}</span>}
               </button>
               <button style={S.iconBtn} onClick={() => setView("shopping")} title={lang === "de" ? "Einkaufsliste" : "Shopping"}>
                 🛒 {shoppingSelection.length > 0 && <span style={S.badge}>{shoppingSelection.length}</span>}
               </button>
-              <button style={S.iconBtn} onClick={() => setDark(!dark)} title={dark ? "Light" : "Dark"}>
-                {dark ? "☀️" : "🌙"}
-              </button>
-              <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>
-                {lang === "de" ? "🇬🇧 EN" : "🇩🇪 DE"}
-              </button>
-              <button style={{ ...S.iconBtn, color: "#D32323", borderColor: "#D3232340" }} onClick={handleLogout} title={user?.email}>
-                ⏻
-              </button>
+              <button style={S.iconBtn} onClick={() => setView("settings")} title={lang === "de" ? "Einstellungen" : "Settings"}>⚙️</button>
+              <button style={S.iconBtn} onClick={() => setDark(!dark)}>{dark ? "☀️" : "🌙"}</button>
+              <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>{lang === "de" ? "🇬🇧" : "🇩🇪"}</button>
+              <button style={{ ...S.iconBtn, color: "#D32323", borderColor: "#D3232340" }} onClick={handleLogout} title={user?.email}>⏻</button>
             </div>
           </header>
 
-          <div style={S.toolbar}>
-            <div style={S.searchWrap}>
-              <span style={S.searchIcon}>🔍</span>
-              <input
-                style={S.searchInput}
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder={lang === "de" ? "Rezept, Zutat oder Tag suchen…" : "Search recipe, ingredient or tag…"}
-              />
-              {search && <button style={S.clearBtn} onClick={() => setSearch("")}>✕</button>}
-            </div>
-            <div style={S.filterBar}>
-              <div style={S.catRow}>
-                {Object.entries(CATEGORIES).map(([key, val]) => (
-                  <button key={key} style={{ ...S.catChip, ...(catFilter === key ? S.catChipActive : {}) }} onClick={() => setCatFilter(key)}>
-                    {val.icon} {val[lang]}
-                  </button>
-                ))}
-              </div>
-              <button style={{ ...S.favToggle, ...(showFavsOnly ? S.favToggleActive : {}) }} onClick={() => setShowFavsOnly(!showFavsOnly)}>
-                {showFavsOnly ? "❤️" : "🤍"} {lang === "de" ? "Favoriten" : "Favorites"}
-              </button>
-            </div>
+          {/* ─── SECTION-TABS ─── */}
+          <div style={S.sectionTabs}>
+            <button
+              style={{ ...S.sectionTab, ...(section === "mine" ? S.sectionTabActive : {}) }}
+              onClick={() => { setSection("mine"); setViewingUser(null); }}
+            >
+              📔 {lang === "de" ? "Mein Kochbuch" : "My Cookbook"}
+            </button>
+            <button
+              style={{ ...S.sectionTab, ...(section === "public" ? S.sectionTabActive : {}) }}
+              onClick={() => { setSection("public"); setViewingUser(null); }}
+            >
+              🌐 {lang === "de" ? "Öffentliches Kochbuch" : "Public Cookbook"}
+            </button>
+            <button
+              style={{ ...S.sectionTab, ...(section === "others" ? S.sectionTabActive : {}) }}
+              onClick={() => { setSection("others"); setViewingUser(null); }}
+            >
+              👥 {lang === "de" ? "Andere Kochbücher" : "Other Cookbooks"}
+            </button>
           </div>
 
-          {filtered.length === 0 ? (
-            <div style={S.emptyState}>
-              <span style={{ fontSize: 56 }}>🍽️</span>
-              <p style={S.emptyText}>
-                {recipes.length === 0
-                  ? (lang === "de" ? "Noch keine Rezepte. Leg los!" : "No recipes yet. Get started!")
-                  : (lang === "de" ? "Keine Rezepte gefunden" : "No recipes found")}
-              </p>
-              <button style={S.emptyBtn} onClick={openNew}>+ {lang === "de" ? "Rezept hinzufügen" : "Add recipe"}</button>
-            </div>
-          ) : (
-            <div style={S.grid}>
-              {filtered.map((r, idx) => (
-                <div key={r.id} className="recipe-card" style={{ ...S.card, animationDelay: `${idx * 60}ms` }}>
-                  <div style={S.cardImgWrap} onClick={() => openDetail(r.id)}>
-                    {r.image_url ? <img src={r.image_url} alt="" style={S.cardImg} /> : <span style={S.cardEmoji}>{r.emoji || "🍳"}</span>}
-                    <button className="fav-btn" style={S.cardFav} onClick={(e) => { e.stopPropagation(); toggleFavorite(r.id); }}>
-                      {favorites.includes(r.id) ? "❤️" : "🤍"}
-                    </button>
-                    <span style={S.cardCatBadge}>
-                      {CATEGORIES[r.category]?.icon} {CATEGORIES[r.category]?.[lang]}
-                    </span>
-                    {r.is_public && <span style={S.publicBadge}>🔗</span>}
-                  </div>
-                  <div style={S.cardBody} onClick={() => openDetail(r.id)}>
-                    <h3 style={S.cardTitle}>{lang === "de" ? r.title_de : (r.title_en || r.title_de)}</h3>
-                    <p style={S.cardDesc}>{lang === "de" ? r.description_de : (r.description_en || r.description_de)}</p>
-                    <div style={S.cardMeta}>
-                      <span style={S.cardMetaItem}>⏱ {r.time_minutes} min</span>
-                      <span style={S.cardMetaItem}>{DIFFICULTIES[r.difficulty]?.icon} {DIFFICULTIES[r.difficulty]?.[lang]}</span>
-                      <span style={S.cardMetaItem}>🍽 {r.base_servings}</span>
-                    </div>
-                  </div>
-                  <div style={S.cardFooter}>
-                    <label style={S.shoppingCheckLabel} onClick={(e) => e.stopPropagation()}>
-                      <input
-                        type="checkbox"
-                        checked={shoppingSelection.includes(r.id)}
-                        onChange={() => toggleShoppingItem(r.id)}
-                        style={S.shoppingCheck}
-                      />
-                      <span>{lang === "de" ? "🛒 Liste" : "🛒 List"}</span>
-                    </label>
-                  </div>
+          {/* ─── ANDERE KOCHBÜCHER: USER-AUSWAHL ─── */}
+          {section === "others" && !viewingUser && (
+            <div style={{ marginTop: 24 }}>
+              <h2 style={{ fontFamily: font, color: C.warm, marginBottom: 16 }}>
+                {lang === "de" ? "Wähle ein Kochbuch:" : "Choose a cookbook:"}
+              </h2>
+              {otherUsers.length === 0 ? (
+                <div style={S.emptyState}>
+                  <span style={{ fontSize: 56 }}>👥</span>
+                  <p style={S.emptyText}>{lang === "de" ? "Noch keine anderen Kochbücher" : "No other cookbooks yet"}</p>
                 </div>
-              ))}
+              ) : (
+                <div style={S.userGrid}>
+                  {otherUsers.map((u) => (
+                    <div key={u.id} style={S.userCard} onClick={() => setViewingUser(u)}>
+                      <div style={S.userAvatar}>{userLabel(u).charAt(0).toUpperCase()}</div>
+                      <div style={{ flex: 1 }}>
+                        <h3 style={S.userName}>{userLabel(u)}</h3>
+                        <p style={S.userMeta}>
+                          {u.recipeCount} {lang === "de" ? "Rezepte" : "recipes"}
+                          {u.cookbook_visibility === "hidden" && " · 🔒 " + (lang === "de" ? "Teaser" : "teaser")}
+                        </p>
+                      </div>
+                      <span style={{ fontSize: 20, color: C.accent }}>→</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
+          )}
+
+          {/* ─── REZEPT-LISTE ─── */}
+          {(section !== "others" || viewingUser) && (
+            <>
+              {section === "others" && viewingUser && (
+                <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 10 }}>
+                  <button style={S.backBtn} onClick={() => setViewingUser(null)}>← {lang === "de" ? "Alle Kochbücher" : "All cookbooks"}</button>
+                  {viewingUser.cookbook_visibility === "hidden" && (
+                    <span style={{ ...S.chip, background: C.accent + "15", color: C.accent, borderColor: C.accent + "40" }}>
+                      🔒 {lang === "de" ? "Nur Teaser sichtbar" : "Teaser only"}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              <div style={S.toolbar}>
+                <div style={S.searchWrap}>
+                  <span style={S.searchIcon}>🔍</span>
+                  <input
+                    style={S.searchInput}
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder={lang === "de" ? "Suchen…" : "Search…"}
+                  />
+                  {search && <button style={S.clearBtn} onClick={() => setSearch("")}>✕</button>}
+                </div>
+                <div style={S.filterBar}>
+                  <div style={S.catRow}>
+                    {Object.entries(CATEGORIES).map(([key, val]) => (
+                      <button key={key} style={{ ...S.catChip, ...(catFilter === key ? S.catChipActive : {}) }} onClick={() => setCatFilter(key)}>
+                        {val.icon} {val[lang]}
+                      </button>
+                    ))}
+                  </div>
+                  <button style={{ ...S.favToggle, ...(showFavsOnly ? S.favToggleActive : {}) }} onClick={() => setShowFavsOnly(!showFavsOnly)}>
+                    {showFavsOnly ? "❤️" : "🤍"} {lang === "de" ? "Favoriten" : "Favorites"}
+                  </button>
+                </div>
+              </div>
+
+              {filtered.length === 0 ? (
+                <div style={S.emptyState}>
+                  <span style={{ fontSize: 56 }}>🍽️</span>
+                  <p style={S.emptyText}>
+                    {section === "mine"
+                      ? (lang === "de" ? "Noch keine eigenen Rezepte" : "No recipes yet")
+                      : (lang === "de" ? "Keine Rezepte gefunden" : "No recipes found")}
+                  </p>
+                  {section === "mine" && (
+                    <button style={S.emptyBtn} onClick={openNew}>+ {lang === "de" ? "Erstes Rezept anlegen" : "Add first recipe"}</button>
+                  )}
+                </div>
+              ) : (
+                <div style={S.grid}>
+                  {filtered.map((r, idx) => {
+                    const owner = profiles.find((p) => p.id === r.user_id);
+                    const isOwn = r.user_id === user.id;
+                    return (
+                      <div key={r.id} className="recipe-card" style={{ ...S.card, animationDelay: `${idx * 60}ms` }}>
+                        <div style={S.cardImgWrap} onClick={() => openDetail(r.id)}>
+                          {r.image_url ? <img src={r.image_url} alt="" style={S.cardImg} /> : <span style={S.cardEmoji}>{r.emoji || "🍳"}</span>}
+                          <button className="fav-btn" style={S.cardFav} onClick={(e) => { e.stopPropagation(); toggleFavorite(r.id); }}>
+                            {favorites.includes(r.id) ? "❤️" : "🤍"}
+                          </button>
+                          <span style={S.cardCatBadge}>{CATEGORIES[r.category]?.icon} {CATEGORIES[r.category]?.[lang]}</span>
+                          {r.visibility === "public" && <span style={S.publicBadge}>🌐</span>}
+                        </div>
+                        <div style={S.cardBody} onClick={() => openDetail(r.id)}>
+                          <h3 style={S.cardTitle}>{lang === "de" ? r.title_de : (r.title_en || r.title_de)}</h3>
+                          {!isOwn && owner && (
+                            <p style={S.cardOwner}>👤 {userLabel(owner)}</p>
+                          )}
+                          {/* Beschreibung nur zeigen, wenn Eigener oder Owner sichtbar oder Public oder Admin */}
+                          {(isOwn || isAdmin || r.visibility === "public" || (owner && owner.cookbook_visibility !== "hidden")) ? (
+                            <p style={S.cardDesc}>{lang === "de" ? r.description_de : (r.description_en || r.description_de)}</p>
+                          ) : (
+                            <p style={S.cardDesc} style={{ ...S.cardDesc, fontStyle: "italic", color: C.soft }}>
+                              🔒 {lang === "de" ? "Inhalt nur auf Anfrage" : "Content on request only"}
+                            </p>
+                          )}
+                          <div style={S.cardMeta}>
+                            <span style={S.cardMetaItem}>⏱ {r.time_minutes} min</span>
+                            <span style={S.cardMetaItem}>{DIFFICULTIES[r.difficulty]?.icon} {DIFFICULTIES[r.difficulty]?.[lang]}</span>
+                            <span style={S.cardMetaItem}>🍽 {r.base_servings}</span>
+                          </div>
+                        </div>
+                        {section === "mine" && (
+                          <div style={S.cardFooter}>
+                            <label style={S.shoppingCheckLabel} onClick={(e) => e.stopPropagation()}>
+                              <input type="checkbox" checked={shoppingSelection.includes(r.id)} onChange={() => toggleShoppingItem(r.id)} style={S.shoppingCheck} />
+                              <span>{lang === "de" ? "🛒 Liste" : "🛒 List"}</span>
+                            </label>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
         </>
       )}
@@ -543,10 +757,14 @@ export default function CookbookApp() {
           isFav={favorites.includes(selectedRecipe.id)}
           onToggleFav={() => toggleFavorite(selectedRecipe.id)}
           onBack={() => setView("list")}
-          onEdit={() => openEdit(selectedRecipe.id)}
-          onDelete={() => setDeleteConfirm(selectedRecipe.id)}
-          onDuplicate={() => duplicateRecipe(selectedRecipe)}
-          onTogglePublic={() => togglePublic(selectedRecipe)}
+          onEdit={canEdit ? () => openEdit(selectedRecipe.id) : null}
+          onDelete={canEdit ? () => setDeleteConfirm(selectedRecipe.id) : null}
+          onDuplicate={isMyRecipe ? () => duplicateRecipe(selectedRecipe) : null}
+          onSetVisibility={isMyRecipe ? (v) => setVisibility(selectedRecipe, v) : null}
+          onCopyToMine={!isMyRecipe && selectedRecipe.visibility === "public" ? () => copyToMine(selectedRecipe) : null}
+          onRequest={!isMyRecipe && selectedRecipe.visibility === "private" ? () => requestRecipe(selectedRecipe) : null}
+          isHidden={isHiddenForMe}
+          owner={detailOwner}
           dark={dark} setDark={setDark}
           C={C} S={S}
         />
@@ -571,39 +789,116 @@ export default function CookbookApp() {
           C={C} S={S}
         />
       )}
+
+      {view === "settings" && (
+        <SettingsView
+          lang={lang}
+          myProfile={myProfile}
+          onToggleVisibility={toggleMyCookbookVisibility}
+          onUpdateName={updateDisplayName}
+          onBack={() => setView("list")}
+          C={C} S={S}
+        />
+      )}
+
+      {view === "requests" && (
+        <RequestsView
+          lang={lang}
+          requests={requests}
+          onAccept={acceptRequest}
+          onReject={rejectRequest}
+          onCancel={cancelRequest}
+          onBack={() => setView("list")}
+          C={C} S={S}
+        />
+      )}
     </div>
   );
+
+  function handleImport() {
+    if (!importUrl.trim() || !importUrl.startsWith("http")) {
+      showToast(lang === "de" ? "Bitte gültige URL" : "Valid URL please", "error");
+      return;
+    }
+    setImporting(true);
+    importAPI.fromUrl(importUrl.trim())
+      .then((recipe) => {
+        setImportedRecipe(recipe);
+        setImportOpen(false);
+        setImportUrl("");
+        setSelectedId(null);
+        setView("form");
+        showToast(lang === "de" ? "Rezept geladen ✓" : "Recipe loaded ✓");
+      })
+      .catch((err) => showToast(err.message, "error"))
+      .finally(() => setImporting(false));
+  }
 }
 
 // ═════════════════════════════════════════════
 //  DETAIL VIEW
 // ═════════════════════════════════════════════
-function DetailView({ recipe: r, lang, setLang, servings, setServings, isFav, onToggleFav, onBack, onEdit, onDelete, onDuplicate, onTogglePublic, dark, setDark, C, S }) {
+function DetailView({ recipe: r, lang, setLang, servings, setServings, isFav, onToggleFav, onBack, onEdit, onDelete, onDuplicate, onSetVisibility, onCopyToMine, onRequest, isHidden, owner, dark, setDark, C, S }) {
   const ratio = servings / (r.base_servings || 4);
   const steps = lang === "de" ? r.steps_de : (r.steps_en || r.steps_de);
   const [checkedSteps, setCheckedSteps] = useState([]);
-
-  const toggleStep = (i) =>
-    setCheckedSteps((prev) => prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i]);
-
   const handlePrint = () => window.print();
+
+  const toggleStep = (i) => setCheckedSteps((prev) => prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i]);
+
+  // Hidden-View: nur Hero + Owner + Anfrage-Button
+  if (isHidden) {
+    return (
+      <div style={S.detailWrap}>
+        <div style={S.detailNav}>
+          <button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button>
+        </div>
+        <div style={S.detailHero}>
+          <div style={S.heroImgWrap}>
+            {r.image_url ? <img src={r.image_url} alt="" style={S.heroImg} /> : <span style={S.heroEmoji}>{r.emoji || "🍳"}</span>}
+          </div>
+          <div style={S.heroInfo}>
+            <h1 style={S.detailTitle}>{lang === "de" ? r.title_de : (r.title_en || r.title_de)}</h1>
+            {owner && <p style={{ color: C.soft, marginTop: 8 }}>👤 {lang === "de" ? "Von" : "By"} {userLabel(owner)}</p>}
+            <div style={{ ...S.chip, marginTop: 16, display: "inline-block", background: C.accent + "15", color: C.accent, borderColor: C.accent + "40" }}>
+              🔒 {lang === "de" ? "Inhalt nur auf Anfrage" : "Content on request only"}
+            </div>
+          </div>
+        </div>
+        <div style={{ marginTop: 32, padding: 24, background: C.card, borderRadius: 16, border: `1px solid ${C.border}`, textAlign: "center" }}>
+          <p style={{ color: C.soft, marginBottom: 16, fontSize: 15 }}>
+            {lang === "de"
+              ? `${userLabel(owner)} hat dieses Rezept verborgen. Du kannst eine Übernahme-Anfrage stellen.`
+              : `${userLabel(owner)} has hidden this recipe. You can send a request to receive it.`}
+          </p>
+          {onRequest && (
+            <button style={S.saveBtn} onClick={onRequest}>📥 {lang === "de" ? "Anfragen" : "Request"}</button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={S.detailWrap} className="printable">
       <div style={S.detailNav} className="no-print">
         <button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={S.editBtn} onClick={onTogglePublic} title={r.is_public ? (lang === "de" ? "Privat machen" : "Make private") : (lang === "de" ? "Teilen" : "Share")}>
-            {r.is_public ? "🔗 " + (lang === "de" ? "Öffentlich" : "Public") : "🔒 " + (lang === "de" ? "Teilen" : "Share")}
-          </button>
-          <button style={S.editBtn} onClick={onDuplicate}>📋 {lang === "de" ? "Kopieren" : "Copy"}</button>
+          {onSetVisibility && (
+            r.visibility === "public" ? (
+              <button style={S.editBtn} onClick={() => onSetVisibility("private")}>🌐 {lang === "de" ? "Öffentlich" : "Public"}</button>
+            ) : (
+              <button style={S.editBtn} onClick={() => onSetVisibility("public")}>📤 {lang === "de" ? "Veröffentlichen" : "Publish"}</button>
+            )
+          )}
+          {onCopyToMine && <button style={S.editBtn} onClick={onCopyToMine}>📥 {lang === "de" ? "Übernehmen" : "Get copy"}</button>}
+          {onRequest && <button style={S.editBtn} onClick={onRequest}>📥 {lang === "de" ? "Anfragen" : "Request"}</button>}
+          {onDuplicate && <button style={S.editBtn} onClick={onDuplicate}>📋 {lang === "de" ? "Kopieren" : "Copy"}</button>}
           <button style={S.editBtn} onClick={handlePrint}>🖨️</button>
-          <button style={S.editBtn} onClick={onEdit}>✏️</button>
-          <button style={S.deleteBtn} onClick={onDelete}>🗑️</button>
+          {onEdit && <button style={S.editBtn} onClick={onEdit}>✏️</button>}
+          {onDelete && <button style={S.deleteBtn} onClick={onDelete}>🗑️</button>}
           <button style={S.iconBtn} onClick={() => setDark(!dark)}>{dark ? "☀️" : "🌙"}</button>
-          <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>
-            {lang === "de" ? "🇬🇧" : "🇩🇪"}
-          </button>
+          <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>{lang === "de" ? "🇬🇧" : "🇩🇪"}</button>
         </div>
       </div>
 
@@ -616,11 +911,13 @@ function DetailView({ recipe: r, lang, setLang, servings, setServings, isFav, on
             <h1 style={S.detailTitle}>{lang === "de" ? r.title_de : (r.title_en || r.title_de)}</h1>
             <button onClick={onToggleFav} style={S.heroFav} className="no-print">{isFav ? "❤️" : "🤍"}</button>
           </div>
+          {owner && <p style={{ color: C.soft, fontSize: 14, margin: "4px 0 12px" }}>👤 {lang === "de" ? "Von" : "By"} {userLabel(owner)}</p>}
           <p style={S.detailDesc}>{lang === "de" ? r.description_de : (r.description_en || r.description_de)}</p>
           <div style={S.detailChips}>
             <span style={S.chip}>{CATEGORIES[r.category]?.icon} {CATEGORIES[r.category]?.[lang]}</span>
             <span style={S.chip}>⏱ {r.time_minutes} min</span>
             <span style={S.chip}>{DIFFICULTIES[r.difficulty]?.icon} {DIFFICULTIES[r.difficulty]?.[lang]}</span>
+            {r.visibility === "public" && <span style={{ ...S.chip, background: C.accent + "15", color: C.accent, borderColor: C.accent + "40" }}>🌐 {lang === "de" ? "Öffentlich" : "Public"}</span>}
           </div>
           {r.tags?.length > 0 && (
             <div style={S.tagRow}>{r.tags.map((t, i) => <span key={i} style={S.tag}>#{t}</span>)}</div>
@@ -655,7 +952,6 @@ function DetailView({ recipe: r, lang, setLang, servings, setServings, isFav, on
             })}
           </div>
         </div>
-
         <div>
           <h2 style={S.sectionHead}>👨‍🍳 {lang === "de" ? "Zubereitung" : "Instructions"}</h2>
           <div style={S.stepsList}>
@@ -690,16 +986,12 @@ function PublicRecipeView({ recipe: r, lang, setLang, C, S, dark, setDark }) {
         <div style={{ display: "flex", gap: 8 }}>
           <button style={S.editBtn} onClick={handlePrint}>🖨️</button>
           <button style={S.iconBtn} onClick={() => setDark(!dark)}>{dark ? "☀️" : "🌙"}</button>
-          <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>
-            {lang === "de" ? "🇬🇧" : "🇩🇪"}
-          </button>
+          <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>{lang === "de" ? "🇬🇧" : "🇩🇪"}</button>
         </div>
       </div>
-
       <div style={{ ...S.chip, display: "inline-block", marginBottom: 16, background: C.accent + "15", color: C.accent, borderColor: C.accent + "40" }} className="no-print">
         🔗 {lang === "de" ? "Geteiltes Rezept" : "Shared recipe"}
       </div>
-
       <div style={S.detailHero}>
         <div style={S.heroImgWrap}>
           {r.image_url ? <img src={r.image_url} alt="" style={S.heroImg} /> : <span style={S.heroEmoji}>{r.emoji || "🍳"}</span>}
@@ -714,7 +1006,6 @@ function PublicRecipeView({ recipe: r, lang, setLang, C, S, dark, setDark }) {
           </div>
         </div>
       </div>
-
       <div style={S.portionBar}>
         <span style={S.portionLabel}>{lang === "de" ? "🍽 Portionen" : "🍽 Servings"}</span>
         <div style={S.portionControls}>
@@ -723,7 +1014,6 @@ function PublicRecipeView({ recipe: r, lang, setLang, C, S, dark, setDark }) {
           <button style={S.portionBtn} onClick={() => setServings(servings + 1)} className="no-print">+</button>
         </div>
       </div>
-
       <div style={S.detailColumns}>
         <div>
           <h2 style={S.sectionHead}>📝 {lang === "de" ? "Zutaten" : "Ingredients"}</h2>
@@ -733,12 +1023,7 @@ function PublicRecipeView({ recipe: r, lang, setLang, C, S, dark, setDark }) {
               const display = amt % 1 === 0 ? amt : amt.toFixed(1);
               const unit = lang === "de" ? (ing.unit_de || ing.unit || "") : (ing.unit_en || ing.unit || "");
               const name = lang === "de" ? ing.name_de : (ing.name_en || ing.name_de);
-              return (
-                <div key={i} style={S.ingRow}>
-                  <span style={S.ingAmt}>{display} {unit}</span>
-                  <span style={S.ingName}>{name}</span>
-                </div>
-              );
+              return <div key={i} style={S.ingRow}><span style={S.ingAmt}>{display} {unit}</span><span style={S.ingName}>{name}</span></div>;
             })}
           </div>
         </div>
@@ -754,19 +1039,153 @@ function PublicRecipeView({ recipe: r, lang, setLang, C, S, dark, setDark }) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
 
-      <div style={{ textAlign: "center", marginTop: 40, paddingTop: 24, borderTop: `1px dashed ${C.border}`, fontSize: 14, color: C.soft }} className="no-print">
-        {lang === "de" ? "📖 Erstellt mit Mein Kochbuch" : "📖 Created with My Cookbook"}
+// ═════════════════════════════════════════════
+//  SETTINGS VIEW
+// ═════════════════════════════════════════════
+function SettingsView({ lang, myProfile, onToggleVisibility, onUpdateName, onBack, C, S }) {
+  const [name, setName] = useState(myProfile?.display_name || "");
+
+  return (
+    <div style={S.formWrap}>
+      <div style={S.formNav}>
+        <button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button>
+      </div>
+      <h1 style={S.formTitle}>⚙️ {lang === "de" ? "Einstellungen" : "Settings"}</h1>
+
+      <div style={S.formSection}>
+        <h2 style={S.formSectionTitle}>👤 {lang === "de" ? "Profil" : "Profile"}</h2>
+        <p style={{ color: C.soft, fontSize: 14, marginBottom: 12 }}>
+          {lang === "de" ? "Email: " : "Email: "}<b>{myProfile?.email}</b>
+          {myProfile?.role === "admin" && <span style={{ ...S.chip, marginLeft: 10, color: C.accent, borderColor: C.accent + "40" }}>👑 Admin</span>}
+        </p>
+        <label style={S.fieldLabel}>{lang === "de" ? "Anzeigename (optional)" : "Display name (optional)"}</label>
+        <div style={{ display: "flex", gap: 10 }}>
+          <input style={{ ...S.input, flex: 1 }} value={name} onChange={(e) => setName(e.target.value)} placeholder={myProfile?.email?.split("@")[0]} />
+          <button style={{ ...S.saveBtn, padding: "10px 24px" }} onClick={() => onUpdateName(name)}>
+            💾 {lang === "de" ? "Speichern" : "Save"}
+          </button>
+        </div>
+      </div>
+
+      <div style={S.formSection}>
+        <h2 style={S.formSectionTitle}>🔒 {lang === "de" ? "Sichtbarkeit deines Kochbuchs" : "Cookbook visibility"}</h2>
+        <p style={{ color: C.soft, fontSize: 14, marginBottom: 16 }}>
+          {lang === "de"
+            ? "Bestimmt, was andere User von deinen privaten Rezepten sehen."
+            : "Controls what others can see of your private recipes."}
+        </p>
+        <div style={{ background: C.card, borderRadius: 14, padding: 18, border: `1px solid ${C.border}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <h3 style={{ margin: 0, fontFamily: font, color: C.warm }}>
+                {myProfile?.cookbook_visibility === "visible"
+                  ? "👁️ " + (lang === "de" ? "Einsehbar" : "Visible")
+                  : "🔒 " + (lang === "de" ? "Nur Teaser sichtbar" : "Teaser only")}
+              </h3>
+              <p style={{ margin: "6px 0 0", color: C.soft, fontSize: 13 }}>
+                {myProfile?.cookbook_visibility === "visible"
+                  ? (lang === "de" ? "Andere sehen deine Rezepte komplett." : "Others see your recipes completely.")
+                  : (lang === "de" ? "Andere sehen nur Titel und Bild. Inhalt nur auf Anfrage." : "Others see only title and image. Content on request.")}
+              </p>
+            </div>
+            <button style={S.editBtn} onClick={onToggleVisibility}>
+              {lang === "de" ? "Umschalten" : "Toggle"}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
 // ═════════════════════════════════════════════
-//  SHOPPING LIST VIEW
+//  REQUESTS VIEW
+// ═════════════════════════════════════════════
+function RequestsView({ lang, requests, onAccept, onReject, onCancel, onBack, C, S }) {
+  const [tab, setTab] = useState("incoming");
+
+  const list = tab === "incoming" ? requests.incoming : requests.outgoing;
+  const pendingIncoming = requests.incoming.filter((r) => r.status === "pending").length;
+
+  return (
+    <div style={S.formWrap}>
+      <div style={S.formNav}>
+        <button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button>
+      </div>
+      <h1 style={S.formTitle}>📬 {lang === "de" ? "Anfragen" : "Requests"}</h1>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+        <button style={{ ...S.sectionTab, ...(tab === "incoming" ? S.sectionTabActive : {}) }} onClick={() => setTab("incoming")}>
+          📥 {lang === "de" ? "Eingang" : "Incoming"} {pendingIncoming > 0 && <span style={S.badge}>{pendingIncoming}</span>}
+        </button>
+        <button style={{ ...S.sectionTab, ...(tab === "outgoing" ? S.sectionTabActive : {}) }} onClick={() => setTab("outgoing")}>
+          📤 {lang === "de" ? "Ausgang" : "Outgoing"}
+        </button>
+      </div>
+
+      {list.length === 0 ? (
+        <div style={S.emptyState}>
+          <span style={{ fontSize: 56 }}>📭</span>
+          <p style={S.emptyText}>{lang === "de" ? "Keine Anfragen" : "No requests"}</p>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {list.map((req) => {
+            const recipe = req.recipes;
+            const otherUser = tab === "incoming" ? req.requester : req.owner;
+            const statusColor = req.status === "pending" ? C.accent : req.status === "accepted" ? "#4CAF50" : "#999";
+            const statusLabel = req.status === "pending"
+              ? (lang === "de" ? "Wartend" : "Pending")
+              : req.status === "accepted"
+                ? (lang === "de" ? "Angenommen" : "Accepted")
+                : (lang === "de" ? "Abgelehnt" : "Rejected");
+
+            return (
+              <div key={req.id} style={{ background: C.card, borderRadius: 14, padding: 16, border: `1px solid ${C.border}`, display: "flex", gap: 14, alignItems: "center" }}>
+                <div style={{ width: 56, height: 56, borderRadius: 12, background: C.parchment, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, flexShrink: 0, overflow: "hidden" }}>
+                  {recipe?.image_url ? <img src={recipe.image_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : recipe?.emoji || "🍳"}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <h3 style={{ margin: 0, fontFamily: font, color: C.warm, fontSize: 16 }}>
+                    {lang === "de" ? recipe?.title_de : (recipe?.title_en || recipe?.title_de)}
+                  </h3>
+                  <p style={{ margin: "4px 0 0", color: C.soft, fontSize: 13 }}>
+                    {tab === "incoming"
+                      ? `${lang === "de" ? "Von" : "From"} ${userLabel(otherUser)}`
+                      : `${lang === "de" ? "An" : "To"} ${userLabel(otherUser)}`}
+                    {" · "}
+                    <span style={{ color: statusColor, fontWeight: 600 }}>{statusLabel}</span>
+                  </p>
+                  {req.message && <p style={{ margin: "6px 0 0", color: C.text, fontSize: 13, fontStyle: "italic" }}>"{req.message}"</p>}
+                </div>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  {tab === "incoming" && req.status === "pending" && (
+                    <>
+                      <button style={S.editBtn} onClick={() => onAccept(req.id)}>✓ {lang === "de" ? "Annehmen" : "Accept"}</button>
+                      <button style={S.deleteBtn} onClick={() => onReject(req.id)}>✕</button>
+                    </>
+                  )}
+                  {tab === "outgoing" && req.status === "pending" && (
+                    <button style={S.deleteBtn} onClick={() => onCancel(req.id)}>{lang === "de" ? "Zurückziehen" : "Cancel"}</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════
+//  SHOPPING LIST
 // ═════════════════════════════════════════════
 function ShoppingListView({ recipes, lang, onBack, onClear, C, S }) {
-  // Zutaten zusammenfassen
   const aggregated = useMemo(() => {
     const map = {};
     recipes.forEach((r) => {
@@ -775,14 +1194,8 @@ function ShoppingListView({ recipes, lang, onBack, onClear, C, S }) {
         if (!name) return;
         const unit = lang === "de" ? (ing.unit_de || ing.unit || "") : (ing.unit_en || ing.unit || "");
         const key = `${name.toLowerCase()}|${unit}`;
-        if (!map[key]) {
-          map[key] = { name, unit, amount: 0, recipes: [] };
-        }
+        if (!map[key]) map[key] = { name, unit, amount: 0, recipes: [] };
         map[key].amount += (parseFloat(ing.amount) || 0);
-        const recipeTitle = lang === "de" ? r.title_de : (r.title_en || r.title_de);
-        if (!map[key].recipes.includes(recipeTitle)) {
-          map[key].recipes.push(recipeTitle);
-        }
       });
     });
     return Object.values(map).sort((a, b) => a.name.localeCompare(b.name));
@@ -794,14 +1207,10 @@ function ShoppingListView({ recipes, lang, onBack, onClear, C, S }) {
   if (recipes.length === 0) {
     return (
       <div style={S.formWrap}>
-        <div style={S.formNav}>
-          <button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button>
-        </div>
+        <div style={S.formNav}><button style={S.backBtn} onClick={onBack}>← {lang === "de" ? "Zurück" : "Back"}</button></div>
         <div style={S.emptyState}>
           <span style={{ fontSize: 56 }}>🛒</span>
-          <p style={S.emptyText}>
-            {lang === "de" ? "Keine Rezepte ausgewählt. Wähle Rezepte für deine Einkaufsliste aus." : "No recipes selected. Pick recipes for your shopping list."}
-          </p>
+          <p style={S.emptyText}>{lang === "de" ? "Keine Rezepte ausgewählt" : "No recipes selected"}</p>
         </div>
       </div>
     );
@@ -816,44 +1225,32 @@ function ShoppingListView({ recipes, lang, onBack, onClear, C, S }) {
           <button style={S.deleteBtn} onClick={onClear}>🗑️ {lang === "de" ? "Leeren" : "Clear"}</button>
         </div>
       </div>
-
       <h1 style={S.formTitle}>🛒 {lang === "de" ? "Einkaufsliste" : "Shopping List"}</h1>
       <p style={{ color: C.soft, marginBottom: 24, fontStyle: "italic" }}>
-        {lang === "de" ? `Aus ${recipes.length} Rezept${recipes.length === 1 ? "" : "en"}:` : `From ${recipes.length} recipe${recipes.length === 1 ? "" : "s"}:`}{" "}
-        {recipes.map((r) => lang === "de" ? r.title_de : (r.title_en || r.title_de)).join(", ")}
+        {lang === "de" ? `Aus ${recipes.length} Rezept${recipes.length === 1 ? "" : "en"}` : `From ${recipes.length} recipe${recipes.length === 1 ? "" : "s"}`}
       </p>
-
       <div style={S.ingList}>
         {aggregated.map((item, i) => {
           const isChecked = checked.includes(i);
           const display = item.amount % 1 === 0 ? item.amount : item.amount.toFixed(1);
           return (
-            <div
-              key={i}
-              style={{ ...S.ingRow, cursor: "pointer", opacity: isChecked ? 0.4 : 1, textDecoration: isChecked ? "line-through" : "none" }}
-              onClick={() => setChecked((prev) => prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i])}
-            >
-              <span style={{ ...S.ingAmt, minWidth: 100 }}>
-                {isChecked ? "☑" : "☐"} {item.amount > 0 ? `${display} ${item.unit}` : ""}
-              </span>
+            <div key={i} style={{ ...S.ingRow, cursor: "pointer", opacity: isChecked ? 0.4 : 1, textDecoration: isChecked ? "line-through" : "none" }}
+              onClick={() => setChecked((prev) => prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i])}>
+              <span style={{ ...S.ingAmt, minWidth: 100 }}>{isChecked ? "☑" : "☐"} {item.amount > 0 ? `${display} ${item.unit}` : ""}</span>
               <span style={S.ingName}>{item.name}</span>
             </div>
           );
         })}
       </div>
-
-      <p style={{ marginTop: 24, fontSize: 13, color: C.soft, textAlign: "center" }} className="no-print">
-        {lang === "de" ? "Tipp: Tippe eine Zeile an, um sie abzuhaken." : "Tip: Tap a row to check it off."}
-      </p>
     </div>
   );
 }
 
 // ═════════════════════════════════════════════
-//  RECIPE FORM
+//  RECIPE FORM (unverändert vom letzten Mal)
 // ═════════════════════════════════════════════
 function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast, C, S }) {
-  const isEdit = !!recipe;
+  const isEdit = !!recipe?.id;
   const fileRef = useRef(null);
   const [uploading, setUploading] = useState(false);
 
@@ -862,57 +1259,46 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
     category: "mains", difficulty: "easy", time_minutes: 30, base_servings: 4,
     image_url: null, emoji: "🍳",
     ingredients: [{ name_de: "", name_en: "", amount: "", unit: "g" }],
-    steps_de: [""], steps_en: [""], tags: [], is_public: false,
+    steps_de: [""], steps_en: [""], tags: [], visibility: "private",
   };
-
   const [form, setForm] = useState(recipe ? { ...empty, ...recipe } : empty);
   const [tagInput, setTagInput] = useState("");
   const [imagePreview, setImagePreview] = useState(recipe?.image_url || null);
 
   const set = (key, val) => setForm((f) => ({ ...f, [key]: val }));
-
-  const setIng = (idx, field, val) => {
-    const updated = [...form.ingredients];
-    updated[idx] = { ...updated[idx], [field]: val };
-    setForm((f) => ({ ...f, ingredients: updated }));
-  };
+  const setIng = (idx, field, val) => { const u = [...form.ingredients]; u[idx] = { ...u[idx], [field]: val }; setForm((f) => ({ ...f, ingredients: u })); };
   const addIng = () => setForm((f) => ({ ...f, ingredients: [...f.ingredients, { name_de: "", name_en: "", amount: "", unit: "g" }] }));
   const removeIng = (idx) => setForm((f) => ({ ...f, ingredients: f.ingredients.filter((_, i) => i !== idx) }));
-
-  const setStep = (lang2, idx, val) => {
-    const key = `steps_${lang2}`;
-    const updated = [...form[key]];
-    updated[idx] = val;
-    setForm((f) => ({ ...f, [key]: updated }));
-  };
-  const addStep = (lang2) => setForm((f) => ({ ...f, [`steps_${lang2}`]: [...f[`steps_${lang2}`], ""] }));
-  const removeStep = (lang2, idx) => setForm((f) => ({ ...f, [`steps_${lang2}`]: f[`steps_${lang2}`].filter((_, i) => i !== idx) }));
-
-  const addTag = () => {
-    if (tagInput.trim() && !form.tags.includes(tagInput.trim().toLowerCase())) {
-      set("tags", [...form.tags, tagInput.trim().toLowerCase()]);
-      setTagInput("");
-    }
-  };
+  const setStep = (l, idx, val) => { const k = `steps_${l}`; const u = [...form[k]]; u[idx] = val; setForm((f) => ({ ...f, [k]: u })); };
+  const addStep = (l) => setForm((f) => ({ ...f, [`steps_${l}`]: [...f[`steps_${l}`], ""] }));
+  const removeStep = (l, idx) => setForm((f) => ({ ...f, [`steps_${l}`]: f[`steps_${l}`].filter((_, i) => i !== idx) }));
+  const addTag = () => { if (tagInput.trim() && !form.tags.includes(tagInput.trim().toLowerCase())) { set("tags", [...form.tags, tagInput.trim().toLowerCase()]); setTagInput(""); } };
   const removeTag = (t) => set("tags", form.tags.filter((x) => x !== t));
 
   const handleImage = async (e) => {
-    const file = e.target.files?.[0];
+    let file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      showToast(lang === "de" ? "Bild zu groß (max 5MB)" : "Image too large (max 5MB)", "error");
-      return;
-    }
+    if (file.size > 10 * 1024 * 1024) { showToast(lang === "de" ? "Bild zu groß (max 10MB)" : "Too large (max 10MB)", "error"); return; }
     setUploading(true);
-    const reader = new FileReader();
-    reader.onload = () => setImagePreview(reader.result);
-    reader.readAsDataURL(file);
     try {
+      const isHeic = /\.heic$|\.heif$/i.test(file.name) || file.type === "image/heic" || file.type === "image/heif";
+      if (isHeic) {
+        showToast(
+          lang === "de"
+            ? "HEIC/HEIF wird in diesem Build nicht unterstützt. Bitte als JPG/PNG/WebP speichern."
+            : "HEIC/HEIF is not supported in this build. Please save as JPG/PNG/WebP.",
+          "error"
+        );
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => setImagePreview(reader.result);
+      reader.readAsDataURL(file);
       const publicUrl = await storageAPI.uploadImage(file);
       set("image_url", publicUrl);
-      showToast(lang === "de" ? "Bild hochgeladen ✓" : "Image uploaded ✓");
+      showToast(lang === "de" ? "Bild hochgeladen ✓" : "Uploaded ✓");
     } catch (err) {
-      showToast((lang === "de" ? "Upload fehlgeschlagen: " : "Upload failed: ") + err.message, "error");
+      showToast(err.message, "error");
       setImagePreview(null);
     } finally {
       setUploading(false);
@@ -920,10 +1306,7 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
   };
 
   const handleSubmit = () => {
-    if (!form.title_de.trim()) {
-      showToast(lang === "de" ? "Bitte gib einen Titel ein" : "Please enter a title", "error");
-      return;
-    }
+    if (!form.title_de.trim()) { showToast(lang === "de" ? "Titel fehlt" : "Title missing", "error"); return; }
     const cleaned = {
       ...form,
       time_minutes: parseInt(form.time_minutes) || 30,
@@ -935,59 +1318,32 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
     onSave(cleaned);
   };
 
-  const L = {
-    title: lang === "de" ? (isEdit ? "Rezept bearbeiten" : "Neues Rezept") : (isEdit ? "Edit Recipe" : "New Recipe"),
-    titleDe: lang === "de" ? "Titel (Deutsch) *" : "Title (German) *",
-    titleEn: lang === "de" ? "Titel (Englisch)" : "Title (English)",
-    descDe: lang === "de" ? "Beschreibung (DE)" : "Description (DE)",
-    descEn: lang === "de" ? "Beschreibung (EN)" : "Description (EN)",
-    cat: lang === "de" ? "Kategorie" : "Category",
-    diff: lang === "de" ? "Schwierigkeit" : "Difficulty",
-    time: lang === "de" ? "Zeit (Min.)" : "Time (min)",
-    portions: lang === "de" ? "Portionen" : "Servings",
-    photo: lang === "de" ? "📷 Foto hochladen (JPG/PNG)" : "📷 Upload Photo (JPG/PNG)",
-    emoji: "Emoji",
-    ingTitle: lang === "de" ? "Zutaten" : "Ingredients",
-    stepsDE: lang === "de" ? "Zubereitung (DE)" : "Steps (DE)",
-    stepsEN: lang === "de" ? "Zubereitung (EN)" : "Steps (EN)",
-    tags: "Tags",
-    save: saving ? (lang === "de" ? "Speichert…" : "Saving…") : (lang === "de" ? "💾 Speichern" : "💾 Save"),
-    cancel: lang === "de" ? "Abbrechen" : "Cancel",
-    addIng: lang === "de" ? "+ Zutat" : "+ Ingredient",
-    addStep: lang === "de" ? "+ Schritt" : "+ Step",
-    nameDe: lang === "de" ? "Name (DE)" : "Name (DE)",
-    nameEn: lang === "de" ? "Name (EN)" : "Name (EN)",
-    amount: lang === "de" ? "Menge" : "Amount",
-    unit: lang === "de" ? "Einheit" : "Unit",
-  };
-
   return (
     <div style={S.formWrap}>
       <div style={S.formNav}>
-        <button style={S.backBtn} onClick={onCancel}>← {L.cancel}</button>
+        <button style={S.backBtn} onClick={onCancel}>← {lang === "de" ? "Abbrechen" : "Cancel"}</button>
         <button style={S.langToggle} onClick={() => setLang(lang === "de" ? "en" : "de")}>{lang === "de" ? "🇬🇧" : "🇩🇪"}</button>
       </div>
-
-      <h1 style={S.formTitle}>{L.title}</h1>
+      <h1 style={S.formTitle}>{isEdit ? (lang === "de" ? "Bearbeiten" : "Edit") : (lang === "de" ? "Neues Rezept" : "New Recipe")}</h1>
 
       <div style={S.imageUploadArea}>
         {imagePreview ? (
           <div style={S.imagePreviewWrap}>
             <img src={imagePreview} alt="" style={S.imagePreview} />
-            {uploading && <div style={S.uploadOverlay}><span>{lang === "de" ? "Wird hochgeladen…" : "Uploading…"}</span></div>}
+            {uploading && <div style={S.uploadOverlay}><span>{lang === "de" ? "Lädt…" : "Loading…"}</span></div>}
             <button style={S.removeImgBtn} onClick={() => { setImagePreview(null); set("image_url", null); }}>✕</button>
           </div>
         ) : (
           <div style={S.uploadPlaceholder} onClick={() => fileRef.current?.click()}>
             <span style={{ fontSize: 40 }}>{form.emoji || "📷"}</span>
-            <p style={S.uploadText}>{L.photo}</p>
+            <p style={S.uploadText}>📷 {lang === "de" ? "Foto hochladen" : "Upload Photo"}</p>
           </div>
         )}
-        <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" style={{ display: "none" }} onChange={handleImage} />
+        <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif" style={{ display: "none" }} onChange={handleImage} />
         {!imagePreview && (
-          <div style={S.emojiPicker}>
-            <label style={S.fieldLabel}>{L.emoji}</label>
-            <div style={S.emojiRow}>
+          <div style={{ marginTop: 12 }}>
+            <label style={S.fieldLabel}>Emoji</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
               {["🍳","🥘","🍲","🥗","🍰","🍞","🥩","🍜","🍕","🥔","🐟","🥧"].map((e) => (
                 <button key={e} style={{ ...S.emojiBtn, ...(form.emoji === e ? S.emojiBtnActive : {}) }} onClick={() => set("emoji", e)}>{e}</button>
               ))}
@@ -997,62 +1353,32 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
       </div>
 
       <div style={S.fieldGrid}>
-        <div style={S.fieldFull}>
-          <label style={S.fieldLabel}>{L.titleDe}</label>
-          <input style={S.input} value={form.title_de} onChange={(e) => set("title_de", e.target.value)} />
-        </div>
-        <div style={S.fieldFull}>
-          <label style={S.fieldLabel}>{L.titleEn}</label>
-          <input style={S.input} value={form.title_en || ""} onChange={(e) => set("title_en", e.target.value)} />
-        </div>
-        <div style={S.fieldFull}>
-          <label style={S.fieldLabel}>{L.descDe}</label>
-          <textarea style={S.textarea} rows={2} value={form.description_de || ""} onChange={(e) => set("description_de", e.target.value)} />
-        </div>
-        <div style={S.fieldFull}>
-          <label style={S.fieldLabel}>{L.descEn}</label>
-          <textarea style={S.textarea} rows={2} value={form.description_en || ""} onChange={(e) => set("description_en", e.target.value)} />
-        </div>
-        <div>
-          <label style={S.fieldLabel}>{L.cat}</label>
-          <select style={S.select} value={form.category} onChange={(e) => set("category", e.target.value)}>
-            {Object.entries(CATEGORIES).filter(([k]) => k !== "all").map(([k, v]) => (
-              <option key={k} value={k}>{v.icon} {v[lang]}</option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label style={S.fieldLabel}>{L.diff}</label>
-          <select style={S.select} value={form.difficulty} onChange={(e) => set("difficulty", e.target.value)}>
-            {Object.entries(DIFFICULTIES).map(([k, v]) => (<option key={k} value={k}>{v.icon} {v[lang]}</option>))}
-          </select>
-        </div>
-        <div>
-          <label style={S.fieldLabel}>{L.time}</label>
-          <input style={S.input} type="number" min={1} value={form.time_minutes} onChange={(e) => set("time_minutes", e.target.value)} />
-        </div>
-        <div>
-          <label style={S.fieldLabel}>{L.portions}</label>
-          <input style={S.input} type="number" min={1} value={form.base_servings} onChange={(e) => set("base_servings", e.target.value)} />
-        </div>
+        <div style={S.fieldFull}><label style={S.fieldLabel}>{lang === "de" ? "Titel (DE) *" : "Title (DE) *"}</label><input style={S.input} value={form.title_de} onChange={(e) => set("title_de", e.target.value)} /></div>
+        <div style={S.fieldFull}><label style={S.fieldLabel}>{lang === "de" ? "Titel (EN)" : "Title (EN)"}</label><input style={S.input} value={form.title_en || ""} onChange={(e) => set("title_en", e.target.value)} /></div>
+        <div style={S.fieldFull}><label style={S.fieldLabel}>{lang === "de" ? "Beschreibung (DE)" : "Description (DE)"}</label><textarea style={S.textarea} rows={2} value={form.description_de || ""} onChange={(e) => set("description_de", e.target.value)} /></div>
+        <div style={S.fieldFull}><label style={S.fieldLabel}>{lang === "de" ? "Beschreibung (EN)" : "Description (EN)"}</label><textarea style={S.textarea} rows={2} value={form.description_en || ""} onChange={(e) => set("description_en", e.target.value)} /></div>
+        <div><label style={S.fieldLabel}>{lang === "de" ? "Kategorie" : "Category"}</label><select style={S.select} value={form.category} onChange={(e) => set("category", e.target.value)}>{Object.entries(CATEGORIES).filter(([k]) => k !== "all").map(([k, v]) => (<option key={k} value={k}>{v.icon} {v[lang]}</option>))}</select></div>
+        <div><label style={S.fieldLabel}>{lang === "de" ? "Schwierigkeit" : "Difficulty"}</label><select style={S.select} value={form.difficulty} onChange={(e) => set("difficulty", e.target.value)}>{Object.entries(DIFFICULTIES).map(([k, v]) => (<option key={k} value={k}>{v.icon} {v[lang]}</option>))}</select></div>
+        <div><label style={S.fieldLabel}>{lang === "de" ? "Zeit (Min.)" : "Time (min)"}</label><input style={S.input} type="number" min={1} value={form.time_minutes} onChange={(e) => set("time_minutes", e.target.value)} /></div>
+        <div><label style={S.fieldLabel}>{lang === "de" ? "Portionen" : "Servings"}</label><input style={S.input} type="number" min={1} value={form.base_servings} onChange={(e) => set("base_servings", e.target.value)} /></div>
       </div>
 
       <div style={S.formSection}>
-        <h2 style={S.formSectionTitle}>📝 {L.ingTitle}</h2>
+        <h2 style={S.formSectionTitle}>📝 {lang === "de" ? "Zutaten" : "Ingredients"}</h2>
         {form.ingredients.map((ing, i) => (
           <div key={i} style={S.ingFormRow}>
-            <input style={{ ...S.input, flex: 2, minWidth: 120 }} placeholder={L.nameDe} value={ing.name_de} onChange={(e) => setIng(i, "name_de", e.target.value)} />
-            <input style={{ ...S.input, flex: 2, minWidth: 120 }} placeholder={L.nameEn} value={ing.name_en || ""} onChange={(e) => setIng(i, "name_en", e.target.value)} />
-            <input style={{ ...S.input, flex: 1, minWidth: 70 }} placeholder={L.amount} type="number" value={ing.amount} onChange={(e) => setIng(i, "amount", parseFloat(e.target.value) || "")} />
-            <input style={{ ...S.input, flex: 1, minWidth: 70 }} placeholder={L.unit} value={ing.unit || ""} onChange={(e) => setIng(i, "unit", e.target.value)} />
+            <input style={{ ...S.input, flex: 2, minWidth: 120 }} placeholder={lang === "de" ? "Name (DE)" : "Name (DE)"} value={ing.name_de} onChange={(e) => setIng(i, "name_de", e.target.value)} />
+            <input style={{ ...S.input, flex: 2, minWidth: 120 }} placeholder={lang === "de" ? "Name (EN)" : "Name (EN)"} value={ing.name_en || ""} onChange={(e) => setIng(i, "name_en", e.target.value)} />
+            <input style={{ ...S.input, flex: 1, minWidth: 70 }} placeholder={lang === "de" ? "Menge" : "Amount"} type="number" value={ing.amount} onChange={(e) => setIng(i, "amount", parseFloat(e.target.value) || "")} />
+            <input style={{ ...S.input, flex: 1, minWidth: 70 }} placeholder={lang === "de" ? "Einheit" : "Unit"} value={ing.unit || ""} onChange={(e) => setIng(i, "unit", e.target.value)} />
             <button style={S.removeRowBtn} onClick={() => removeIng(i)}>✕</button>
           </div>
         ))}
-        <button style={S.addRowBtn} onClick={addIng}>{L.addIng}</button>
+        <button style={S.addRowBtn} onClick={addIng}>+ {lang === "de" ? "Zutat" : "Ingredient"}</button>
       </div>
 
       <div style={S.formSection}>
-        <h2 style={S.formSectionTitle}>🇩🇪 {L.stepsDE}</h2>
+        <h2 style={S.formSectionTitle}>🇩🇪 {lang === "de" ? "Zubereitung (DE)" : "Steps (DE)"}</h2>
         {form.steps_de.map((step, i) => (
           <div key={i} style={S.stepFormRow}>
             <span style={S.stepFormNum}>{i + 1}</span>
@@ -1060,11 +1386,11 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
             <button style={S.removeRowBtn} onClick={() => removeStep("de", i)}>✕</button>
           </div>
         ))}
-        <button style={S.addRowBtn} onClick={() => addStep("de")}>{L.addStep}</button>
+        <button style={S.addRowBtn} onClick={() => addStep("de")}>+ {lang === "de" ? "Schritt" : "Step"}</button>
       </div>
 
       <div style={S.formSection}>
-        <h2 style={S.formSectionTitle}>🇬🇧 {L.stepsEN}</h2>
+        <h2 style={S.formSectionTitle}>🇬🇧 {lang === "de" ? "Zubereitung (EN)" : "Steps (EN)"}</h2>
         {form.steps_en.map((step, i) => (
           <div key={i} style={S.stepFormRow}>
             <span style={S.stepFormNum}>{i + 1}</span>
@@ -1072,18 +1398,17 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
             <button style={S.removeRowBtn} onClick={() => removeStep("en", i)}>✕</button>
           </div>
         ))}
-        <button style={S.addRowBtn} onClick={() => addStep("en")}>{L.addStep}</button>
+        <button style={S.addRowBtn} onClick={() => addStep("en")}>+ {lang === "de" ? "Schritt" : "Step"}</button>
       </div>
 
       <div style={S.formSection}>
-        <h2 style={S.formSectionTitle}>🏷️ {L.tags}</h2>
-        <div style={S.tagInputRow}>
+        <h2 style={S.formSectionTitle}>🏷️ Tags</h2>
+        <div style={{ display: "flex", gap: 8 }}>
           <input style={{ ...S.input, flex: 1 }} value={tagInput} onChange={(e) => setTagInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addTag())}
-            placeholder={lang === "de" ? "Tag eingeben + Enter" : "Enter tag + Enter"} />
+            onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addTag())} placeholder={lang === "de" ? "Tag + Enter" : "Tag + Enter"} />
           <button style={{ ...S.addRowBtn, width: "auto", padding: "10px 20px" }} onClick={addTag}>+</button>
         </div>
-        <div style={S.tagList}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
           {form.tags.map((t) => (
             <span key={t} style={S.tagBubble}>#{t} <button style={S.tagRemove} onClick={() => removeTag(t)}>✕</button></span>
           ))}
@@ -1091,15 +1416,17 @@ function RecipeForm({ lang, setLang, recipe, onSave, onCancel, saving, showToast
       </div>
 
       <div style={S.formActions}>
-        <button style={S.cancelBtn} onClick={onCancel} disabled={saving}>{L.cancel}</button>
-        <button style={{ ...S.saveBtn, opacity: saving ? 0.6 : 1 }} onClick={handleSubmit} disabled={saving || uploading}>{L.save}</button>
+        <button style={S.cancelBtn} onClick={onCancel} disabled={saving}>{lang === "de" ? "Abbrechen" : "Cancel"}</button>
+        <button style={{ ...S.saveBtn, opacity: saving ? 0.6 : 1 }} onClick={handleSubmit} disabled={saving || uploading}>
+          {saving ? (lang === "de" ? "Speichert…" : "Saving…") : "💾 " + (lang === "de" ? "Speichern" : "Save")}
+        </button>
       </div>
     </div>
   );
 }
 
 // ═════════════════════════════════════════════
-//  THEMES
+//  THEMES & STYLES
 // ═════════════════════════════════════════════
 const LIGHT = {
   warm: "#4A3228", cream: "#FDF6EC", parchment: "#F0E0C8",
